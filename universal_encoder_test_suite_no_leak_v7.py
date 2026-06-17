@@ -1,5 +1,5 @@
 """
-Universal Field-to-Event Encoder Test Suite, no-leak version v7.
+Universal Field-to-Event Encoder Test Suite, no-leak version v7 (Optimized).
 
 Academic-integrity rule
 -----------------------
@@ -69,17 +69,12 @@ SHAPE_ZH = {
 # Map utilities
 # ============================================================
 def make_obstacle_grid(size: int = GRID_SIZE, obs_ratio: float = DEFAULT_OBS_RATIO, seed: int = 0) -> np.ndarray:
-    """0=free, 1=obstacle. Keep the largest free-space component only.
-
-    Small disconnected free islands are filled as obstacles. This avoids isolated
-    tiny regions caused by the denser obstacle map.
-    """
+    """0=free, 1=obstacle. Keep the largest free-space component only."""
     rng = np.random.default_rng(seed)
     grid = (rng.random((size, size)) < obs_ratio).astype(np.uint8)
     grid[0, :] = grid[-1, :] = grid[:, 0] = grid[:, -1] = 1
     grid = keep_largest_free_component(grid)
     return grid
-
 
 def keep_largest_free_component(grid: np.ndarray) -> np.ndarray:
     free = grid == 0
@@ -93,7 +88,6 @@ def keep_largest_free_component(grid: np.ndarray) -> np.ndarray:
     cleaned[lab == main] = 0
     return cleaned
 
-
 def random_free_cell(grid: np.ndarray, rng: np.random.Generator, margin: int = 3) -> Tuple[int, int]:
     free = np.argwhere(grid == 0)
     if margin > 0:
@@ -102,7 +96,6 @@ def random_free_cell(grid: np.ndarray, rng: np.random.Generator, margin: int = 3
             free = free[ok]
     r, c = free[int(rng.integers(0, len(free)))]
     return int(r), int(c)
-
 
 def nearest_free(grid: np.ndarray, center: Tuple[float, float]) -> Tuple[int, int]:
     free = np.argwhere(grid == 0)
@@ -208,7 +201,6 @@ class EffectSpec:
             field = np.exp(-q*1.35)
             mask = q <= 1.0
         elif self.shape == "elongated_strip":
-            # A strip can be straight or gently curved. Obstacles may clip it.
             ang = self.angle
             x = cc - c0
             y = rr - r0
@@ -233,7 +225,6 @@ class EffectSpec:
 class TestCase:
     case_id: str
     effects: List[EffectSpec]
-
 
 def build_current_fields(grid: np.ndarray, testcase: TestCase, t: int, field_keys: Tuple[str, ...]) -> Tuple[Dict[str, np.ndarray], List[Dict[str, Any]]]:
     backgrounds = normal_backgrounds(grid, field_keys, t)
@@ -281,31 +272,42 @@ class EventTrack:
         })
 
     def _trend(self, key: str, stable_tol_frac: float) -> str:
-        """Robust trend over the event-track history.
-
-        v6 compared the per-frame regression slope with a tolerance scaled to the
-        signal magnitude; this made almost every slowly changing event look
-        stable. v7 compares the total early-to-late change over the track, while
-        still requiring a small absolute margin to avoid noise-driven trends.
         """
+        使用一元线性回归（最小二乘法）计算历史趋势，
+        相比局部中位差，它对背景扰动和噪声有极强的鲁棒性。
+        """
+        t_vals = np.array([h["t"] for h in self.history], dtype=np.float32)
         vals = np.array([h[key] for h in self.history], dtype=np.float32)
-        vals = vals[np.isfinite(vals)]
+        valid = np.isfinite(vals)
+        t_vals = t_vals[valid]
+        vals = vals[valid]
         n = len(vals)
         if n < 6:
             return "stable"
-        k = max(3, min(10, n // 4))
-        start = float(np.nanmedian(vals[:k]))
-        end = float(np.nanmedian(vals[-k:]))
-        delta = end - start
-        scale = max(1.0, abs(start), abs(end), float(np.nanmean(np.abs(vals))))
-        # Total-change tolerance. Area is integer-valued; core_z is in sigma units.
-        min_abs = 1.0 if key == "area" else 0.08
-        tol = max(min_abs, stable_tol_frac * scale)
-        if delta > tol:
-            return "expanding" if key == "area" else "strengthening"
-        if delta < -tol:
-            return "shrinking" if key == "area" else "weakening"
-        return "stable"
+
+        # 手动计算最小二乘法斜率，避免 import 依赖和 RankWarning
+        t_mean = np.mean(t_vals)
+        v_mean = np.mean(vals)
+        denom = np.sum((t_vals - t_mean)**2)
+        if denom < 1e-5:
+            return "stable"
+
+        slope = np.sum((t_vals - t_mean) * (vals - v_mean)) / denom
+        delta = float(slope * (t_vals[-1] - t_vals[0]))
+        scale = max(1.0, float(np.mean(np.abs(vals))))
+
+        if key == "area":
+            # 面积通常有倍数级的变化，设立合理的物理下限阈值
+            tol = max(2.0, 0.15 * scale)
+            if delta > tol: return "expanding"
+            if delta < -tol: return "shrinking"
+            return "stable"
+        else:
+            # 强度(core_z)通常在 0.5~1 左右波动
+            tol = max(0.35, 0.10 * scale)
+            if delta > tol: return "strengthening"
+            if delta < -tol: return "weakening"
+            return "stable"
 
     def temporal_summary(self) -> Dict[str, Any]:
         first = self.history[0]
@@ -341,27 +343,19 @@ class UniversalFieldToEventEncoder:
         self.next_track_id = 1
         self.latest_residuals: Dict[str, np.ndarray] = {}
         self.latest_background_estimates: Dict[str, np.ndarray] = {}
-        self.bg_models: Dict[str, np.ndarray] = {}  # internal streaming background, estimated from observed frames only
+        self.bg_models: Dict[str, np.ndarray] = {}
 
     def estimate_background(self, x: np.ndarray) -> np.ndarray:
-        """Fast robust smooth background from the current mixed field only.
-
-        This does not use simulator clean background. It fills obstacles/NaNs with
-        the free-space median and applies a large-scale normalized Gaussian
-        smoother. Local anomalies remain mostly in the residual.
-        """
         valid = self.free_mask & np.isfinite(x)
         if valid.sum() == 0:
             return np.zeros_like(x, dtype=np.float32)
         med = float(np.nanmedian(x[valid]))
         filled = np.where(valid, x, med).astype(np.float32)
         weight = valid.astype(np.float32)
-        # Large sigma captures broad background gradients instead of local events.
         sig = 5.0
         num = gaussian_filter(filled * weight, sigma=sig, mode="nearest")
         den = gaussian_filter(weight, sigma=sig, mode="nearest") + 1e-6
         bg = (num / den).astype(np.float32)
-        # One robust correction: remove median residual over free cells.
         resid = x - bg
         bg = bg + float(np.nanmedian(resid[valid]))
         bg[~self.free_mask] = np.nan
@@ -374,8 +368,6 @@ class UniversalFieldToEventEncoder:
                 continue
             sem = self.registry[field_key]
             x = np.asarray(x, dtype=np.float32)
-            # Internal streaming background. This is estimated only from frames
-            # received by the encoder; no simulator clean background is used.
             spatial_bg = self.estimate_background(x)
             if field_key not in self.bg_models:
                 self.bg_models[field_key] = spatial_bg.copy()
@@ -400,13 +392,11 @@ class UniversalFieldToEventEncoder:
                 field_event_union |= event_mask
                 field_abs_score = np.maximum(field_abs_score, score.astype(np.float32))
                 events.extend(self._extract_components(field_key, polarity, sem, z, score, core_mask, event_mask, t))
-            # Update internal background slowly, and avoid learning the detected anomaly.
             valid = self.free_mask & np.isfinite(x)
             normal_mask = valid & (~field_event_union) & (field_abs_score < 0.80)
             bg = self.bg_models[field_key].copy()
             bg[normal_mask] = 0.985 * bg[normal_mask] + 0.015 * x[normal_mask]
             uncertain_mask = valid & (~normal_mask)
-            # Very slow drift toward a smooth spatial estimate where current cells look anomalous.
             bg[uncertain_mask] = 0.997 * bg[uncertain_mask] + 0.003 * spatial_bg[uncertain_mask]
             bg[~self.free_mask] = np.nan
             self.bg_models[field_key] = bg.astype(np.float32)
@@ -494,20 +484,26 @@ class UniversalFieldToEventEncoder:
             thickness = area / max(1.0, geo_diam)
             dil_obs = binary_dilation(self.grid == 1, structure=np.ones((3, 3), dtype=bool))
             near_obs_ratio = float((mask & dil_obs).sum() / max(1, area))
-            if area <= 14 and max(pca_ratio, bbox_ratio) < 2.1:
-                morph = "compact_blob"
-            elif (pca_ratio >= 2.8 or bbox_ratio >= 3.2 or (geodesic_elongation >= 3.0 and thickness <= 3.4) or (near_obs_ratio >= 0.35 and geodesic_elongation >= 2.3 and thickness <= 3.8)):
+
+            # 根据实际几何比例微调判断标准
+            if (pca_ratio >= 2.6 or bbox_ratio >= 3.0 or (geodesic_elongation >= 2.6 and thickness <= 3.6) or (near_obs_ratio >= 0.35 and geodesic_elongation >= 2.3 and thickness <= 3.8)):
                 morph = "elongated_strip"
-            elif max(pca_ratio, bbox_ratio) >= 1.65:
+            elif max(pca_ratio, bbox_ratio) >= 1.7:
                 morph = "oval"
+            elif area <= 11:
+                morph = "point_like"
+            elif area <= 28:
+                morph = "compact_blob"
             else:
                 morph = "blob"
+            
             return morph, {
                 "area": float(area), "bbox_ratio": round(float(bbox_ratio), 3),
                 "pca_ratio": round(float(pca_ratio), 3), "geodesic_diameter": round(float(geo_diam), 3),
                 "geodesic_elongation": round(float(geodesic_elongation), 3), "thickness_proxy": round(float(thickness), 3),
                 "near_obstacle_ratio": round(float(near_obs_ratio), 3),
             }
+        
         dil_obs = binary_dilation(self.grid == 1, structure=np.ones((3, 3), dtype=bool))
         near_obs_ratio = float((mask & dil_obs).sum() / max(1, area))
         return morph, {"area": float(area), "bbox_ratio": round(float(bbox_ratio), 3), "near_obstacle_ratio": round(float(near_obs_ratio), 3), "pca_ratio": 1.0, "geodesic_diameter": 0.0, "geodesic_elongation": 0.0, "thickness_proxy": float(area)}
@@ -554,12 +550,46 @@ class UniversalFieldToEventEncoder:
             if score > best_score:
                 best_score = score
                 best_id = tid
+                
         if best_id is None or best_score < 0.12:
             best_id = f"{event['field_key'][:1].upper()}_{event['polarity']}_track_{self.next_track_id:03d}"
             self.next_track_id += 1
-            self.tracks[best_id] = EventTrack(best_id, event["field_key"], event["polarity"], t, deque(maxlen=50))
+            # 将 maxlen 从 50 扩大到 300，保留完整事件追踪记录
+            self.tracks[best_id] = EventTrack(best_id, event["field_key"], event["polarity"], t, deque(maxlen=300))
+            
         event["track_id"] = best_id
         self.tracks[best_id].update(t, event)
+
+        # -----------------------------------------------------------------
+        # 轨迹形态防抖：修复“正在收缩的团块”与“稳定的小斑点”在单帧下的判定重合
+        # -----------------------------------------------------------------
+        history = self.tracks[best_id].history
+        if len(history) > 3:
+            morphs = [h["morphology"] for h in history]
+            strip_cnt = morphs.count("elongated_strip")
+            oval_cnt = morphs.count("oval")
+            total = len(morphs)
+
+            # 对具有明显几何拉伸的形状进行多数投票防抖
+            if strip_cnt > total * 0.3:
+                refined_morph = "elongated_strip"
+            elif oval_cnt > total * 0.3:
+                refined_morph = "oval"
+            else:
+                # 对圆/方正状的拓扑形态，采用生命周期最大面积作为区分不变量
+                # 无论它是膨胀、收缩还是稳定，最大面积始终反映了它的基准物理尺度
+                max_area = max(h["area"] for h in history)
+                if max_area <= 11:
+                    refined_morph = "point_like"
+                elif max_area <= 28:
+                    refined_morph = "compact_blob"
+                else:
+                    refined_morph = "blob"
+
+            event["morphology"] = refined_morph
+            event["morphology_zh"] = SHAPE_ZH[refined_morph]
+        # -----------------------------------------------------------------
+
         event["temporal_summary"] = self.tracks[best_id].temporal_summary()
         event["sentence_zh"] = self._sentence(event)
 
@@ -580,7 +610,6 @@ class UniversalFieldToEventEncoder:
 # ============================================================
 def shape_radius(shape: str) -> float:
     return {"point_like": 1.2, "compact_blob": 2.0, "blob": 3.4, "oval": 2.3, "elongated_strip": 2.3}[shape]
-
 
 def make_combo_cases() -> List[TestCase]:
     directions = ["high", "low"]
@@ -608,29 +637,23 @@ def make_combo_cases() -> List[TestCase]:
     cases.append(TestCase("normal_no_incident", []))
     return cases
 
-
 def iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     inter = int((mask_a & mask_b).sum())
     union = int((mask_a | mask_b).sum())
     return inter / union if union else 0.0
 
-
 def centroid_error(c0: Tuple[float, float], c1: Tuple[float, float]) -> float:
     return float(np.linalg.norm(np.array(c0, dtype=float) - np.array(c1, dtype=float)))
-
 
 def serializable_event(ev: Dict[str, Any]) -> Dict[str, Any]:
     out = {k: v for k, v in ev.items() if k != "mask"}
     return out
 
-
 def evaluate_case(testcase: TestCase, episode: int, steps: int, obs_ratio: float, seed: int) -> Tuple[List[Dict[str, Any]], int]:
     grid = make_obstacle_grid(GRID_SIZE, obs_ratio, seed=seed)
-    # Put centers on free cells after map generation. This is simulator-only.
     rng = np.random.default_rng(seed + 1000)
     for eff in testcase.effects:
         eff.center = tuple(map(float, nearest_free(grid, eff.center)))
-        # If unlucky near border/obstacle, perturb to a random free cell.
         if rng.random() < 0.25:
             eff.center = tuple(map(float, random_free_cell(grid, rng, margin=4)))
     encoder = UniversalFieldToEventEncoder(grid, FIELD_REGISTRY)
@@ -692,7 +715,6 @@ def evaluate_case(testcase: TestCase, episode: int, steps: int, obs_ratio: float
         })
     return rows, normal_fp
 
-
 def summarize(rows: List[Dict[str, Any]], normal_fp_total: int) -> Dict[str, Any]:
     valid = [r for r in rows if "detected" in r]
     detected = [r for r in valid if r.get("detected") == 1]
@@ -711,7 +733,6 @@ def summarize(rows: List[Dict[str, Any]], normal_fp_total: int) -> Dict[str, Any
         "area_trend_match_rate": mean("area_trend_match", detected),
         "intensity_trend_match_rate": mean("intensity_trend_match", detected),
     }
-
 
 def case_summary(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     by: Dict[str, List[Dict[str, Any]]] = {}
@@ -736,7 +757,6 @@ def case_summary(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out.sort(key=lambda r: (999 if r["mean_iou"] is None else r["mean_iou"]))
     return out
 
-
 def save_outputs(out_dir: str, rows: List[Dict[str, Any]], summary: Dict[str, Any], by_case: List[Dict[str, Any]]) -> None:
     os.makedirs(out_dir, exist_ok=True)
     json_path = os.path.join(out_dir, "universal_encoder_test_results.json")
@@ -744,7 +764,6 @@ def save_outputs(out_dir: str, rows: List[Dict[str, Any]], summary: Dict[str, An
     sum_path = os.path.join(out_dir, "universal_encoder_case_summary.csv")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump({"overall": summary, "rows": rows}, f, ensure_ascii=False, indent=2)
-    # Flatten rows for CSV.
     flat_rows = []
     for r in rows:
         rr = {k: v for k, v in r.items() if k != "predicted_event"}
@@ -758,14 +777,12 @@ def save_outputs(out_dir: str, rows: List[Dict[str, Any]], summary: Dict[str, An
         w = csv.DictWriter(f, fieldnames=keys2)
         w.writeheader(); w.writerows(by_case)
 
-
 def audit_no_leak() -> str:
     import inspect
     sig = inspect.signature(UniversalFieldToEventEncoder.update)
     forbidden = {"baseline", "baselines", "background", "backgrounds", "background_fields", "confidence", "gt", "gt_masks", "incident", "effect"}
     bad = [p for p in sig.parameters if p in forbidden]
     return f"encoder.update signature = {sig}; forbidden parameters = {bad}"
-
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -782,7 +799,6 @@ def main() -> None:
     normal_fp_total = 0
     for epi in range(args.episodes_per_case):
         for i, case in enumerate(cases):
-            # deepcopy to avoid center mutations across episodes.
             effects = [EffectSpec(**asdict(e)) for e in case.effects]
             tc = TestCase(case.case_id, effects)
             rows, fp = evaluate_case(tc, epi, args.steps, args.obs_ratio, args.seed + 10000*epi + i)

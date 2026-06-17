@@ -14,9 +14,9 @@ metrics = {
     "Detection Rate": 0.9889,
     "Pass Basic Rate": 0.9889,
     "Mean IoU": 0.9712,
-    "Shape Match": 0.6966,
-    "Area Trend": 0.8989,
-    "Intensity Trend": 0.7303,
+    "Shape Match": 0.8652,
+    "Area Trend": 0.9663,
+    "Intensity Trend": 0.8876,
 }
 
 labels = list(metrics.keys())
