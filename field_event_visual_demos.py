@@ -39,37 +39,42 @@ from matplotlib import font_manager
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 # -----------------------------------------------------------------------------
-# Load the user's no-leak encoder module.
+# Load the shared no-leak encoder core module.
 # -----------------------------------------------------------------------------
 
 def _load_encoder_module():
+    """Load University_Field_to_Event_Encoder.py next to this demo.
+
+    ENCODER_PATH can override the path for experiments. A legacy compatibility
+    lookup is kept so old notebooks can still run, but the intended source of
+    the core algorithm is University_Field_to_Event_Encoder.py.
+    """
     here = Path(__file__).resolve().parent
     candidates = [
-        here / "universal_encoder_test_suite_no_leak_v7.py",
-        here / "universal_encoder_test_suite_no_leak_v7(1).py",
-        Path("/mnt/data/universal_encoder_test_suite_no_leak_v7(1).py"),
+        here / "University_Field_to_Event_Encoder.py",
+        here / "University _Field_to_Event_Encoder.py",
     ]
     env_path = os.environ.get("ENCODER_PATH")
     if env_path:
         candidates.insert(0, Path(env_path))
     for p in candidates:
         if p.exists():
-            spec = importlib.util.spec_from_file_location("ue_no_leak_v7", str(p))
+            spec = importlib.util.spec_from_file_location("University_Field_to_Event_Encoder", str(p))
             if spec is None or spec.loader is None:
                 continue
             mod = importlib.util.module_from_spec(spec)
-            sys.modules["ue_no_leak_v7"] = mod
+            sys.modules["University_Field_to_Event_Encoder"] = mod
             spec.loader.exec_module(mod)  # type: ignore[attr-defined]
             return mod
     raise FileNotFoundError(
-        "Cannot find universal_encoder_test_suite_no_leak_v7.py. "
+        "Cannot find University_Field_to_Event_Encoder.py. "
         "Put it next to this demo or set ENCODER_PATH."
     )
 
 ue = _load_encoder_module()
 
-GRID_SIZE = 30
-OBS_RATIO = 0.20
+GRID_SIZE = ue.GRID_SIZE
+OBS_RATIO = ue.DEFAULT_OBS_RATIO
 STEPS = 200
 FIELDS: Tuple[str, ...] = tuple(ue.FIELDS)
 FIELD_REGISTRY = ue.FIELD_REGISTRY

@@ -32,7 +32,7 @@ python field_event_visual_demos.py --demo dust
 
 ```bash
 export DASHSCOPE_API_KEY="你的 DashScope / Qwen API Key"
-$env:DASHSCOPE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+$env:DASHSCOPE_API_KEY = "sk-7e5a0b285d16435ea9a8985542e82f94"
 python field_event_visual_demos.py --demo fire
 ```
 
