@@ -177,15 +177,9 @@ def macro_f1(y_true: Sequence[str], y_pred: Sequence[str], labels: Sequence[str]
         tp = sum(1 for a, b in zip(y_true, y_pred) if a == lab and b == lab)
         fp = sum(1 for a, b in zip(y_true, y_pred) if a != lab and b == lab)
         fn = sum(1 for a, b in zip(y_true, y_pred) if a == lab and b != lab)
-        support_or_prediction = (tp + fp + fn) > 0
-        if not support_or_prediction:
-            continue
-        if tp == 0:
-            scores.append(0.0)
-            continue
-        p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        scores.append(0.0 if (p + r) == 0 else 2 * p * r / (p + r))
+        _, _, f1 = precision_recall_f1(tp, fp, fn)
+        if f1 is not None:
+            scores.append(f1)
     return float(np.mean(scores)) if scores else None
 
 # ============================================================
@@ -678,46 +672,45 @@ def current_field_summary(fields_by_t: List[Dict[str, np.ndarray]], free_mask: n
         }
     return summary
 
-def observation_quality_summary(fields_by_t: List[Dict[str, np.ndarray]], free_mask: np.ndarray,
-                                recent_frames: int = 20) -> Dict[str, Any]:
+
+def observation_quality(fields_by_t: List[Dict[str, np.ndarray]], free_mask: np.ndarray) -> Dict[str, Any]:
+    """Observation-quality metadata derived only from observed fields.
+
+    This is evaluator-side input for LLM/rules baselines, not encoder input. It
+    helps high-level methods distinguish normal/no-event cases from missing or
+    low-confidence cases without leaking GT accident labels.
+    """
     if not fields_by_t:
         return {
-            "max_missing_fraction": 1.0,
-            "max_recent_diff_noise_sigma": None,
-            "max_recent_temporal_std_sigma": None,
-            "high_missing_fields": [],
-            "high_noise_fields": [],
+            "n_observed_frames": 0,
+            "last_frame_missing_fraction": 1.0,
+            "field_missing_fraction": {},
+            "low_confidence": True,
         }
     last = fields_by_t[-1]
-    recent = fields_by_t[-max(2, int(recent_frames)):]
-    per_field: Dict[str, Dict[str, Any]] = {}
-    for k in FIELDS:
-        if k not in last:
-            continue
-        sem = FIELD_REGISTRY[k]
-        arr_last = np.asarray(last[k], dtype=np.float32)
-        missing = float(np.sum(free_mask & ~np.isfinite(arr_last)) / max(1, int(free_mask.sum())))
-        diff_noise = None
-        temporal_std = None
-        stack = np.array([np.asarray(f[k], dtype=np.float32) for f in recent if k in f], dtype=np.float32)
-        if stack.shape[0] >= 2:
-            diffs = np.diff(stack, axis=0)[:, free_mask]
-            diff_noise = float(np.nanstd(diffs) / (sem.sigma + 1e-6))
-            temporal_std = float(np.nanmedian(np.nanstd(stack[:, free_mask], axis=0)) / (sem.sigma + 1e-6))
-        per_field[k] = {
-            "missing_fraction": round(missing, 4),
-            "recent_diff_noise_sigma": None if diff_noise is None else round(diff_noise, 4),
-            "recent_temporal_std_sigma": None if temporal_std is None else round(temporal_std, 4),
-        }
-    diff_vals = [v["recent_diff_noise_sigma"] for v in per_field.values() if v["recent_diff_noise_sigma"] is not None]
-    std_vals = [v["recent_temporal_std_sigma"] for v in per_field.values() if v["recent_temporal_std_sigma"] is not None]
+    field_missing: Dict[str, float] = {}
+    per_field_values = []
+    for k, arr in last.items():
+        valid = free_mask & np.isfinite(arr)
+        total = int(np.sum(free_mask))
+        miss = 1.0 - float(np.sum(valid)) / max(1, total)
+        field_missing[k] = round(float(miss), 6)
+        per_field_values.append(miss)
+    last_missing = float(np.mean(per_field_values)) if per_field_values else 1.0
+    temporal_missing = []
+    for frame in fields_by_t:
+        vals = []
+        for arr in frame.values():
+            valid = free_mask & np.isfinite(arr)
+            vals.append(1.0 - float(np.sum(valid)) / max(1, int(np.sum(free_mask))))
+        if vals:
+            temporal_missing.append(float(np.mean(vals)))
     return {
-        "max_missing_fraction": round(float(max([v["missing_fraction"] for v in per_field.values()] or [1.0])), 4),
-        "max_recent_diff_noise_sigma": round(float(max(diff_vals)), 4) if diff_vals else None,
-        "max_recent_temporal_std_sigma": round(float(max(std_vals)), 4) if std_vals else None,
-        "high_missing_fields": [k for k, v in per_field.items() if float(v["missing_fraction"]) >= 0.20],
-        "high_noise_fields": [k for k, v in per_field.items() if (v["recent_diff_noise_sigma"] is not None and float(v["recent_diff_noise_sigma"]) >= 0.20)],
-        "per_field": per_field,
+        "n_observed_frames": int(len(fields_by_t)),
+        "last_frame_missing_fraction": round(float(last_missing), 6),
+        "mean_missing_fraction_over_window": round(float(np.mean(temporal_missing)), 6) if temporal_missing else None,
+        "field_missing_fraction": field_missing,
+        "low_confidence": bool(last_missing >= 0.20),
     }
 
 def render_fields_image(fields: Dict[str, np.ndarray], out_path: str, title: str = "fields") -> Optional[str]:
@@ -926,63 +919,113 @@ def event_presence(events: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
             pres[k][p] = max(pres[k][p], float(ev.get("z_core_mean", 0.0) or ev.get("priority", 0.0) or 0.0))
     return pres
 
-def diagnose_by_rules(events: List[Dict[str, Any]], source_name: str = "events") -> Dict[str, Any]:
+def _cluster_spread(events: List[Dict[str, Any]]) -> float:
+    pts = []
+    for ev in events:
+        c = ev.get("centroid")
+        if isinstance(c, (list, tuple)) and len(c) >= 2:
+            try:
+                pts.append((float(c[0]), float(c[1])))
+            except Exception:
+                pass
+    if len(pts) < 2:
+        return 0.0
+    arr = np.array(pts, dtype=float)
+    return float(np.max(np.linalg.norm(arr[:, None, :] - arr[None, :, :], axis=-1)))
+
+def _event_strength(events: List[Dict[str, Any]], field_key: str, polarity: str = "high") -> float:
+    vals = []
+    for ev in events:
+        if ev.get("field_key") == field_key and ev.get("polarity") == polarity:
+            vals.append(float(ev.get("z_core_mean", ev.get("score_sum", ev.get("priority", 0.0))) or 0.0))
+    return max(vals) if vals else 0.0
+
+def diagnose_by_rules(events: List[Dict[str, Any]], source_name: str = "events", observation_quality: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Generic rule baseline, intentionally not an oracle.
+
+    The rule system uses only low-level events and optional observation-quality
+    metadata derived from the observed fields.  It deliberately avoids template
+    branches that memorize the benchmark scenario IDs.  Ambiguous multi-field or
+    missing-data cases are sent to review unless a simple canonical pattern is
+    clearly present.
+    """
+    observation_quality = observation_quality or {}
     pres = event_presence(events)
     high = lambda k: pres.get(k, {}).get("high", 0.0) > 0
     low = lambda k: pres.get(k, {}).get("low", 0.0) > 0
+    strength = lambda k, p="high": _event_strength(events, k, p)
     n_fields = sum(1 for k in FIELDS if high(k) or low(k))
+    event_count = len(events)
+    missing_rate = float(observation_quality.get("last_frame_missing_fraction", 0.0) or 0.0)
+    spread = _cluster_spread(events)
+
     label = "normal"
-    conf = 0.55
+    conf = 0.58
     review = False
-    reasons = []
-    if high("temperature") and (high("air_quality") or high("co2")):
-        if high("humidity"):
-            label = "composite_anomaly"
-            conf = 0.72
-            review = True
-            reasons.append("temperature/AQI or CO2 plus humidity suggests composite incident")
+    reasons: List[str] = []
+
+    if event_count == 0:
+        # No event tokens means no actionable local evidence. Missing or weak
+        # observation quality triggers review; otherwise the generic rule keeps
+        # the normal label.
+        if missing_rate >= 0.20:
+            label, conf, review = "needs_review_unknown", 0.45, True
+            reasons.append("no event tokens and substantial missing observations")
         else:
-            label = "fire"
-            conf = 0.82
-            reasons.append("high temperature with air quality/CO2 evidence")
-    elif high("temperature") and high("humidity") and high("pressure"):
-        label = "steam_leak"
-        conf = 0.84
-        reasons.append("high humidity with temperature and pressure disturbance")
-    elif high("humidity") and not high("temperature"):
-        label = "water_leak"
-        conf = 0.78
-        reasons.append("humidity anomaly without thermal signature")
-    elif high("temperature"):
-        label = "electrical_overheat"
-        conf = 0.74
-        reasons.append("isolated high temperature")
-    elif high("co2") and not high("air_quality"):
-        label = "co2_accumulation"
-        conf = 0.78
-        reasons.append("CO2-specific anomaly")
-    elif high("co2") and high("air_quality"):
-        label = "co2_accumulation"
-        conf = 0.72
-        reasons.append("CO2 is present, stronger than generic air quality evidence")
-    elif high("air_quality"):
-        label = "dust_pollution"
-        conf = 0.74
-        reasons.append("air-quality anomaly without CO2 field evidence")
-    elif n_fields >= 2:
-        label = "needs_review_unknown"
-        conf = 0.50
-        review = True
-        reasons.append("multi-field pattern does not match known rule templates")
+            label, conf, review = "normal", 0.72, False
+            reasons.append("no coherent event tokens")
     else:
-        label = "normal"
-        conf = 0.70
-        reasons.append("no consistent event pattern")
-    if len(events) == 0:
-        label, conf = "normal", 0.75
-    if any(float(ev.get("z_core_mean", 0.0) or 0.0) < 1.0 for ev in events) and len(events) <= 2:
-        review = True
-        conf = min(conf, 0.58)
+        fire_like = high("temperature") and (high("air_quality") or high("co2"))
+        leak_like = high("humidity")
+        steam_like = high("humidity") and high("temperature") and high("pressure")
+        water_like = high("humidity") and not high("temperature")
+        co2_like = high("co2") and strength("co2") >= max(0.8, 0.85 * strength("air_quality"))
+        dust_like = high("air_quality") and not high("co2")
+        thermal_only = high("temperature") and not high("air_quality") and not high("co2") and not high("humidity")
+
+        # Conservative composite criterion: distinct physical sub-patterns and
+        # enough spatial separation.  Ordinary coupled multi-field signatures
+        # such as steam or fire should not be called composite.
+        if fire_like and leak_like and spread >= 5.0 and event_count >= 3:
+            label, conf, review = "composite_anomaly", 0.68, True
+            reasons.append("spatially separated fire-like and leak-like event groups")
+        elif steam_like:
+            label, conf = "steam_leak", 0.76
+            reasons.append("humidity, temperature, and pressure co-occur")
+        elif fire_like and not leak_like:
+            label, conf = "fire", 0.76
+            reasons.append("temperature co-occurs with combustion-side AQI/CO2 evidence")
+        elif water_like:
+            label, conf = "water_leak", 0.72
+            reasons.append("humidity anomaly without thermal event")
+        elif thermal_only:
+            label, conf = "electrical_overheat", 0.70
+            reasons.append("isolated temperature event without combustion-side fields")
+        elif co2_like:
+            label, conf = "co2_accumulation", 0.70
+            reasons.append("CO2-specific event is present")
+        elif dust_like:
+            label, conf = "dust_pollution", 0.70
+            reasons.append("air-quality event without CO2 event")
+        elif n_fields >= 2:
+            label, conf, review = "needs_review_unknown", 0.50, True
+            reasons.append("multi-field pattern is outside simple generic rule templates")
+        else:
+            label, conf, review = "needs_review_unknown", 0.48, True
+            reasons.append("single weak/local event is insufficient for a hard accident label")
+
+        # Observation-quality and weak-evidence gates.  These are derived from
+        # the input representation, not from ground truth labels.
+        weak_events = [ev for ev in events if float(ev.get("z_core_mean", 0.0) or 0.0) < 1.15]
+        if missing_rate >= 0.25:
+            review = True
+            conf = min(conf, 0.60)
+            reasons.append("missing/low-confidence observations require review")
+        if weak_events and event_count <= 2:
+            review = True
+            conf = min(conf, 0.58)
+            reasons.append("weak event evidence requires confirmation")
+
     target = None
     if events:
         target_ev = max(events, key=lambda e: float(e.get("priority", e.get("score_sum", 0.0)) or 0.0))
@@ -991,9 +1034,9 @@ def diagnose_by_rules(events: List[Dict[str, Any]], source_name: str = "events")
         "accident_type": label,
         "confidence": round(float(conf), 3),
         "review_needed": bool(review),
-        "abnormal_confirmed": bool(label != "normal" and conf >= 0.55 and not (review and conf < 0.60)),
+        "abnormal_confirmed": bool(label not in {"normal", "needs_review_unknown"} and conf >= 0.55 and not (review and conf < 0.62)),
         "resample_target": target,
-        "explanation": f"Rule diagnosis from {source_name}: " + "; ".join(reasons),
+        "explanation": f"Generic rule diagnosis from {source_name}: " + "; ".join(reasons),
         "evidence_fields": [k for k in FIELDS if high(k) or low(k)],
     }
 
@@ -1371,7 +1414,7 @@ def offline_llm_proxy(payload: Dict[str, Any], mode: str) -> Dict[str, Any]:
     # only the same public input representation that would be sent to the model.
     events = payload.get("events") or []
     field_summary = payload.get("field_summary") or {}
-    guessed = diagnose_by_rules(events, source_name=f"offline_{mode}") if events else diagnose_from_matrix_summary(field_summary)
+    guessed = diagnose_by_rules(events, source_name=f"offline_{mode}", observation_quality=payload.get("observation_quality")) if events else diagnose_from_matrix_summary(field_summary)
     guessed["explanation"] = f"Offline proxy ({mode}); replace with --api-mode api for real LLM/VLM measurement. " + guessed.get("explanation", "")
     return guessed
 
@@ -1382,7 +1425,7 @@ def diagnose_from_matrix_summary(field_summary: Dict[str, Any]) -> Dict[str, Any
             events.append({"field_key": k, "polarity": "high", "z_core_mean": s.get("max_abs_spatial_z", 0), "priority": s.get("max_abs_spatial_z", 0), "centroid": None})
         if s.get("low_z_cells", 0) > 2:
             events.append({"field_key": k, "polarity": "low", "z_core_mean": s.get("max_abs_spatial_z", 0), "priority": s.get("max_abs_spatial_z", 0), "centroid": None})
-    return diagnose_by_rules(events, source_name="raw_matrix_summary")
+    return diagnose_by_rules(events, source_name="raw_matrix_summary", observation_quality=field_summary.get("observation_quality") if isinstance(field_summary, dict) else None)
 
 def build_diagnosis_prompt(input_kind: str, scenario_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     allowed = ", ".join(ACCIDENT_TYPES)
@@ -1394,19 +1437,22 @@ def build_diagnosis_prompt(input_kind: str, scenario_payload: Dict[str, Any]) ->
         "\"review_needed\": bool, \"abnormal_confirmed\": bool, "
         "\"resample_target\": {\"field_key\": str|null, \"centroid\": [row,col]|null}|null, "
         "\"evidence_fields\": [str], \"explanation\": str}. "
-        "Use these decision boundaries: "
-        "empty events with low missing/noise quality means normal, not needs_review_unknown; "
-        "empty or weak events with high recent noise quality means low_snr_anomaly; "
-        "high missing_fraction or high_missing_fields means needs_review_unknown unless a complete canonical signature remains; "
-        "steam_leak is high humidity plus high temperature plus pressure disturbance in one coupled plume/source; do not call it composite_anomaly. "
-        "fire is high temperature plus air_quality and/or CO2 combustion evidence; do not call it composite_anomaly unless there is a separate leak-like cluster. "
-        "composite_anomaly requires at least two spatially separated physical incident clusters, such as fire-like heat/AQI evidence and a distinct humidity leak cluster. "
-        "pressure plus air_quality without CO2/temperature/humidity template is an unseen combination and should be needs_review_unknown. "
-        "Prefer a specific known accident only when the required field combination is present; otherwise choose normal or needs_review_unknown according to evidence quality."
+        "Use only the provided observation representation. Do not assume hidden labels. "
+        "Decision guidance: fire requires high temperature plus combustion-side AQI/CO2 evidence; "
+        "electrical_overheat is mainly isolated high temperature without AQI/CO2/humidity support; "
+        "steam_leak requires high humidity together with high temperature and pressure; "
+        "water_leak is humidity-dominant without a thermal steam signature; "
+        "co2_accumulation requires CO2-specific evidence, while dust_pollution is air-quality evidence without CO2 support. "
+        "Composite anomaly should be used only when two or more spatially/physically distinct incident patterns coexist; "
+        "do not label an ordinary coupled steam/fire signature as composite. "
+        "If event evidence is empty and observation quality is good, prefer normal. "
+        "If evidence is missing, low-confidence, or outside known templates, prefer needs_review_unknown and set review_needed=true. "
+        "For low-SNR evidence, use low_snr_anomaly only when weak but coherent multi-field trends are present; otherwise request review. "
+        "In the explanation, explicitly cite the fields and trends used."
     )
     user = {
         "input_kind": input_kind,
-        "task": "Diagnose the accident type from the provided no-leak observation representation. First consider observation_quality, then classify the event pattern using the decision boundaries.",
+        "task": "Diagnose the accident type and propose review/resampling action from the provided no-leak observation representation.",
         "payload": scenario_payload,
     }
     return [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(user, ensure_ascii=False)}]
@@ -1414,14 +1460,14 @@ def build_diagnosis_prompt(input_kind: str, scenario_payload: Dict[str, Any]) ->
 def build_vlm_messages(image_data_url: str, scenario_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     allowed = ", ".join(ACCIDENT_TYPES)
     text = (
-        "You are diagnosing industrial multi-physics field images. "
+        "You are diagnosing industrial multi-physics temporal contact-sheet images. "
         f"Allowed accident_type labels: {allowed}. "
-        "Use only the image pixels and metadata values, not file names or scenario names. "
-        "Decision boundaries: steam_leak is coupled humidity+temperature+pressure; fire is heat plus AQI/CO2 combustion evidence; "
-        "composite_anomaly requires two spatially separated incident clusters; high missing data should be needs_review_unknown; "
-        "high image/field noise without a coherent accident signature should be low_snr_anomaly; empty/no coherent evidence with low noise means normal. "
-        "Use the image plus the metadata below. Return only JSON with keys: "
-        "accident_type, confidence, review_needed, abnormal_confirmed, resample_target, evidence_fields, explanation.\n"
+        "Rows correspond to physical fields and columns correspond to sampled times. "
+        "Use temporal changes, co-location across fields, and missing/low-confidence evidence. "
+        "Return only JSON with keys: accident_type, confidence, review_needed, abnormal_confirmed, "
+        "resample_target, evidence_fields, explanation. "
+        "Composite anomaly requires distinct coexisting incident patterns, not merely several coupled fields. "
+        "If the image is ambiguous or affected by missing data, choose needs_review_unknown.\n"
         + json.dumps(scenario_payload, ensure_ascii=False)
     )
     return [
@@ -1431,6 +1477,7 @@ def build_vlm_messages(image_data_url: str, scenario_payload: Dict[str, Any]) ->
             {"type": "image_url", "image_url": {"url": image_data_url}},
         ]},
     ]
+
 
 # ============================================================
 # Layer 1 metrics
@@ -1582,7 +1629,8 @@ def build_method_inputs(trace_threshold: RunTrace, trace_f2e: RunTrace, image_di
     fields_at_diagnosis = fields_for_diagnosis[-1] if fields_for_diagnosis else trace_f2e.fields_last
     matrix_t0 = time.perf_counter()
     matrix_summary = current_field_summary(fields_for_diagnosis, trace_f2e.grid == 0)
-    quality_summary = observation_quality_summary(fields_for_diagnosis, trace_f2e.grid == 0)
+    obs_quality = observation_quality(fields_for_diagnosis, trace_f2e.grid == 0)
+    matrix_summary["observation_quality"] = obs_quality
     matrix_latency_ms = (time.perf_counter() - matrix_t0) * 1000.0
     img_path: Optional[str]
     frame_indices: List[int]
@@ -1592,7 +1640,7 @@ def build_method_inputs(trace_threshold: RunTrace, trace_f2e: RunTrace, image_di
         img_path = render_fields_image(
             fields_at_diagnosis,
             os.path.join(image_dir, f"{trace_f2e.scenario.scenario_id}_seed{trace_f2e.seed}_last.png"),
-            "field_observation",
+            trace_f2e.scenario.scenario_id,
         )
         image_render_latency_ms = (time.perf_counter() - image_t0) * 1000.0
         frame_indices = [int(diag_t)]
@@ -1601,7 +1649,7 @@ def build_method_inputs(trace_threshold: RunTrace, trace_f2e: RunTrace, image_di
         img_path, frame_indices = render_fields_contact_sheet(
             fields_for_diagnosis,
             os.path.join(image_dir, f"{trace_f2e.scenario.scenario_id}_seed{trace_f2e.seed}_{vlm_frame_mode}{vlm_num_frames}.png"),
-            "field_observation",
+            trace_f2e.scenario.scenario_id,
             mode=vlm_frame_mode,
             num_frames=vlm_num_frames,
         )
@@ -1614,13 +1662,11 @@ def build_method_inputs(trace_threshold: RunTrace, trace_f2e: RunTrace, image_di
     }
     return {
         "diagnosis_t": {"t": int(diag_t), "llm_interval_steps": int(llm_interval_steps)},
-        "observation_quality": quality_summary,
-        "threshold_events": {"events": th_events, "observation_quality": quality_summary, "representation_latency_ms": prep_latency["threshold_events"], "diagnosis_t": int(diag_t)},
-        "f2e_events": {"events": f2e_events, "observation_quality": quality_summary, "representation_latency_ms": prep_latency["f2e_events"], "diagnosis_t": int(diag_t)},
-        "raw_matrix_summary": {"field_summary": matrix_summary, "observation_quality": quality_summary, "representation_latency_ms": prep_latency["raw_matrix_summary"]},
+        "threshold_events": {"events": th_events, "observation_quality": obs_quality, "representation_latency_ms": prep_latency["threshold_events"], "diagnosis_t": int(diag_t)},
+        "f2e_events": {"events": f2e_events, "observation_quality": obs_quality, "representation_latency_ms": prep_latency["f2e_events"], "diagnosis_t": int(diag_t)},
+        "raw_matrix_summary": {"field_summary": matrix_summary, "representation_latency_ms": prep_latency["raw_matrix_summary"]},
         "raw_field_image": {
             "field_summary": matrix_summary,
-            "observation_quality": quality_summary,
             "image_path": img_path,
             "diagnosis_t": int(diag_t),
             "vlm_frame_mode": vlm_frame_mode,
@@ -1656,25 +1702,24 @@ def run_layer2(scenarios: List[AccidentScenario], seeds: int, steps: int, obs_ra
             method_inputs = build_method_inputs(trace_threshold, trace_f2e, image_dir, vlm_frame_mode, vlm_num_frames, llm_interval_steps)
             diag_t = int((method_inputs.get("diagnosis_t") or {}).get("t", steps - 1))
             f2e_history_frames = diag_t + 1
-            quality = method_inputs.get("observation_quality", {})
             for method in methods:
                 method_t0 = time.perf_counter()
                 representation_latency_ms = 0.0
-                call_res = ModelCallResult(True, "", {}, 0.0, 0, 0, 0, model="rules", token_count_source="not_applicable_rules")
+                call_res = ModelCallResult(True, "", {}, 0.0, None, None, None, model="rules", token_count_source="not_applicable_rules")
                 if method == "threshold_events_rules":
                     representation_latency_ms = float(method_inputs["threshold_events"].get("representation_latency_ms") or 0.0)
-                    diag = diagnose_by_rules(method_inputs["threshold_events"]["events"], source_name="threshold_events")
+                    diag = diagnose_by_rules(method_inputs["threshold_events"]["events"], source_name="threshold_events", observation_quality=method_inputs["threshold_events"].get("observation_quality"))
                 elif method == "f2e_events_rules":
                     representation_latency_ms = float(method_inputs["f2e_events"].get("representation_latency_ms") or 0.0)
-                    diag = diagnose_by_rules(method_inputs["f2e_events"]["events"], source_name="f2e_events")
+                    diag = diagnose_by_rules(method_inputs["f2e_events"]["events"], source_name="f2e_events", observation_quality=method_inputs["f2e_events"].get("observation_quality"))
                 elif method == "threshold_events_llm":
                     representation_latency_ms = float(method_inputs["threshold_events"].get("representation_latency_ms") or 0.0)
                     payload = {
                         "events": method_inputs["threshold_events"]["events"],
-                        "observation_quality": method_inputs["threshold_events"]["observation_quality"],
                         "observation_representation": "threshold_connected_component_events",
                         "diagnosis_t": diag_t,
                         "history_frames_processed": f2e_history_frames,
+                        "observation_quality": method_inputs["threshold_events"].get("observation_quality"),
                     }
                     messages = build_diagnosis_prompt("threshold_events", payload)
                     call_res = call_or_offline(client, api_mode, llm_model, messages, payload, "threshold_events_llm", token_counter)
@@ -1683,10 +1728,10 @@ def run_layer2(scenarios: List[AccidentScenario], seeds: int, steps: int, obs_ra
                     representation_latency_ms = float(method_inputs["f2e_events"].get("representation_latency_ms") or 0.0)
                     payload = {
                         "events": method_inputs["f2e_events"]["events"],
-                        "observation_quality": method_inputs["f2e_events"]["observation_quality"],
                         "observation_representation": "F2E_structured_event_tokens",
                         "diagnosis_t": diag_t,
                         "history_frames_processed": f2e_history_frames,
+                        "observation_quality": method_inputs["f2e_events"].get("observation_quality"),
                     }
                     messages = build_diagnosis_prompt("f2e_events", payload)
                     call_res = call_or_offline(client, api_mode, llm_model, messages, payload, "f2e_events_llm", token_counter)
@@ -1695,10 +1740,10 @@ def run_layer2(scenarios: List[AccidentScenario], seeds: int, steps: int, obs_ra
                     representation_latency_ms = float(method_inputs["raw_matrix_summary"].get("representation_latency_ms") or 0.0)
                     payload = {
                         "field_summary": method_inputs["raw_matrix_summary"]["field_summary"],
-                        "observation_quality": method_inputs["raw_matrix_summary"]["observation_quality"],
                         "observation_representation": "raw_matrix_statistical_summary",
                         "diagnosis_t": diag_t,
                         "history_frames_observed": f2e_history_frames,
+                        "observation_quality": (method_inputs["raw_matrix_summary"].get("field_summary") or {}).get("observation_quality"),
                     }
                     messages = build_diagnosis_prompt("raw_matrix_summary", payload)
                     call_res = call_or_offline(client, api_mode, llm_model, messages, payload, "raw_matrix_summary_llm", token_counter)
@@ -1708,12 +1753,12 @@ def run_layer2(scenarios: List[AccidentScenario], seeds: int, steps: int, obs_ra
                     img_path = method_inputs["raw_field_image"].get("image_path")
                     payload = {
                         "field_summary": method_inputs["raw_field_image"]["field_summary"],
-                        "observation_quality": method_inputs["raw_field_image"]["observation_quality"],
                         "observation_representation": "raw_field_image_temporal_contact_sheet",
                         "diagnosis_t": diag_t,
                         "history_frames_observed": f2e_history_frames,
                         "vlm_frame_mode": method_inputs["raw_field_image"].get("vlm_frame_mode"),
                         "vlm_frame_indices": method_inputs["raw_field_image"].get("vlm_frame_indices"),
+                        "observation_quality": (method_inputs["raw_field_image"].get("field_summary") or {}).get("observation_quality"),
                     }
                     if img_path and os.path.exists(img_path):
                         messages = build_vlm_messages(image_to_data_url(img_path), payload)
@@ -1762,10 +1807,8 @@ def run_layer2(scenarios: List[AccidentScenario], seeds: int, steps: int, obs_ra
                     "llm_interval_steps": int(llm_interval_steps),
                     "f2e_history_frames": f2e_history_frames,
                     "input_event_count": input_event_count,
-                    "max_missing_fraction": quality.get("max_missing_fraction"),
-                    "max_recent_diff_noise_sigma": quality.get("max_recent_diff_noise_sigma"),
-                    "high_missing_fields": ",".join(map(str, quality.get("high_missing_fields", []))) if isinstance(quality.get("high_missing_fields"), list) else "",
-                    "high_noise_fields": ",".join(map(str, quality.get("high_noise_fields", []))) if isinstance(quality.get("high_noise_fields"), list) else "",
+                    "observation_low_confidence": ((method_inputs.get("f2e_events", {}).get("observation_quality") or {}).get("low_confidence")),
+                    "last_frame_missing_fraction": ((method_inputs.get("f2e_events", {}).get("observation_quality") or {}).get("last_frame_missing_fraction")),
                     "review_needed": diag.get("review_needed"),
                     "confidence": diag.get("confidence"),
                     "explanation_correctness": round(float(exp_score), 6),
@@ -1815,9 +1858,16 @@ def aggregate_layer2(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         api_usage_rows = [r for r in rs if r.get("api_usage_available")]
         estimated_rows = [r for r in rs if r.get("token_count_is_estimate")]
         uncached_api_rows = [r for r in rs if r.get("measured_api_latency_ms") is not None]
+        token_applicable_rows = [r for r in rs if r.get("token_count_source") != "not_applicable_rules"]
+        token_measured_rows = [r for r in token_applicable_rows if r.get("total_tokens") is not None]
+        missing_token_rows = [r for r in token_applicable_rows if r.get("total_tokens") is None]
         out.append({
             "method": method,
             "n": len(rs),
+            "token_applicable_n": len(token_applicable_rows),
+            "token_measured_n": len(token_measured_rows),
+            "token_missing_n": len(missing_token_rows),
+            "token_not_applicable_n": len(rs) - len(token_applicable_rows),
             "accident_classification_accuracy": round(float(np.mean([r.get("correct", 0) for r in rs])), 6) if rs else None,
             "macro_f1": round(float(macro_f1(y_true, y_pred, ACCIDENT_TYPES)), 6) if macro_f1(y_true, y_pred, ACCIDENT_TYPES) is not None else None,
             "ambiguous_case_accuracy": round(float(np.mean([r.get("correct", 0) for r in amb])), 6) if amb else None,
@@ -1827,17 +1877,17 @@ def aggregate_layer2(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "low_snr_accuracy": round(float(np.mean([r.get("correct", 0) for r in low_snr])), 6) if low_snr else None,
             "expected_review_success": round(float(np.mean([1 if r.get("review_needed") else 0 for r in expected_review])), 6) if expected_review else None,
             "explanation_correctness": round(float(safe_mean([r.get("explanation_correctness") for r in rs])), 6) if safe_mean([r.get("explanation_correctness") for r in rs]) is not None else None,
-            "mean_prompt_tokens": round(float(safe_mean([r.get("prompt_tokens") for r in rs])), 3) if safe_mean([r.get("prompt_tokens") for r in rs]) is not None else None,
-            "mean_completion_tokens": round(float(safe_mean([r.get("completion_tokens") for r in rs])), 3) if safe_mean([r.get("completion_tokens") for r in rs]) is not None else None,
-            "mean_total_tokens": round(float(safe_mean([r.get("total_tokens") for r in rs])), 3) if safe_mean([r.get("total_tokens") for r in rs]) is not None else None,
+            "mean_prompt_tokens": round(float(safe_mean([r.get("prompt_tokens") for r in token_applicable_rows])), 3) if safe_mean([r.get("prompt_tokens") for r in token_applicable_rows]) is not None else None,
+            "mean_completion_tokens": round(float(safe_mean([r.get("completion_tokens") for r in token_applicable_rows])), 3) if safe_mean([r.get("completion_tokens") for r in token_applicable_rows]) is not None else None,
+            "mean_total_tokens": round(float(safe_mean([r.get("total_tokens") for r in token_applicable_rows])), 3) if safe_mean([r.get("total_tokens") for r in token_applicable_rows]) is not None else None,
             "mean_total_tokens_api_only": round(float(safe_mean([r.get("total_tokens") for r in api_usage_rows])), 3) if safe_mean([r.get("total_tokens") for r in api_usage_rows]) is not None else None,
             "mean_total_tokens_estimated_only": round(float(safe_mean([r.get("total_tokens") for r in estimated_rows])), 3) if safe_mean([r.get("total_tokens") for r in estimated_rows]) is not None else None,
-            "api_usage_rate": round(float(np.mean([1 if r.get("api_usage_available") else 0 for r in rs])), 6) if rs else None,
-            "token_estimate_rate": round(float(np.mean([1 if r.get("token_count_is_estimate") else 0 for r in rs])), 6) if rs else None,
-            "mean_prompt_text_tokens": round(float(safe_mean([r.get("prompt_text_tokens") for r in rs])), 3) if safe_mean([r.get("prompt_text_tokens") for r in rs]) is not None else None,
-            "mean_prompt_image_tokens": round(float(safe_mean([r.get("prompt_image_tokens") for r in rs])), 3) if safe_mean([r.get("prompt_image_tokens") for r in rs]) is not None else None,
-            "mean_prompt_cached_tokens": round(float(safe_mean([r.get("prompt_cached_tokens") for r in rs])), 3) if safe_mean([r.get("prompt_cached_tokens") for r in rs]) is not None else None,
-            "mean_completion_reasoning_tokens": round(float(safe_mean([r.get("completion_reasoning_tokens") for r in rs])), 3) if safe_mean([r.get("completion_reasoning_tokens") for r in rs]) is not None else None,
+            "api_usage_rate": round(float(np.mean([1 if r.get("api_usage_available") else 0 for r in token_applicable_rows])), 6) if token_applicable_rows else None,
+            "token_estimate_rate": round(float(np.mean([1 if r.get("token_count_is_estimate") else 0 for r in token_applicable_rows])), 6) if token_applicable_rows else None,
+            "mean_prompt_text_tokens": round(float(safe_mean([r.get("prompt_text_tokens") for r in token_applicable_rows])), 3) if safe_mean([r.get("prompt_text_tokens") for r in token_applicable_rows]) is not None else None,
+            "mean_prompt_image_tokens": round(float(safe_mean([r.get("prompt_image_tokens") for r in token_applicable_rows])), 3) if safe_mean([r.get("prompt_image_tokens") for r in token_applicable_rows]) is not None else None,
+            "mean_prompt_cached_tokens": round(float(safe_mean([r.get("prompt_cached_tokens") for r in token_applicable_rows])), 3) if safe_mean([r.get("prompt_cached_tokens") for r in token_applicable_rows]) is not None else None,
+            "mean_completion_reasoning_tokens": round(float(safe_mean([r.get("completion_reasoning_tokens") for r in token_applicable_rows])), 3) if safe_mean([r.get("completion_reasoning_tokens") for r in token_applicable_rows]) is not None else None,
             "mean_api_latency_ms": round(float(safe_mean([r.get("api_latency_ms") for r in rs])), 3) if safe_mean([r.get("api_latency_ms") for r in rs]) is not None else None,
             "mean_measured_api_latency_ms": round(float(safe_mean([r.get("measured_api_latency_ms") for r in uncached_api_rows])), 3) if safe_mean([r.get("measured_api_latency_ms") for r in uncached_api_rows]) is not None else None,
             "mean_diagnosis_wall_ms": round(float(safe_mean([r.get("diagnosis_wall_ms") for r in rs])), 3) if safe_mean([r.get("diagnosis_wall_ms") for r in rs]) is not None else None,
@@ -1967,7 +2017,7 @@ def main() -> None:
         "tokenizer_model": token_counter.tokenizer_model,
         "tokenizer_local_files_only": not args.tokenizer_allow_download,
         "token_counter_status": token_counter.status(),
-        "token_accounting_note": "Primary token metrics use DashScope/OpenAI-compatible response usage. Fallback counts are estimates and flagged per row.",
+        "token_accounting_note": "Primary token metrics use DashScope/OpenAI-compatible response usage. Rules have token_not_applicable_n and blank token columns; fallback counts are estimates and flagged per row.",
         "scenario_design": [
             {
                 "scenario_id": s.scenario_id,
