@@ -1,13 +1,13 @@
 """Comprehensive comparison experiments for Field-to-Event (F2E) + LLM systems.
 
-Version: v8.2.1
+Version: v8.2.3
 
 This script is intentionally an experiment/evaluation layer only.  It imports the
 core no-leak F2E encoder from University_Field_to_Event_Encoder.py and never
 passes clean backgrounds, GT masks, injected labels, or accident labels into the
 encoder.
 
-Three-layer experimental design
+Two-layer experimental design
 -------------------------------
 Layer 1: Low-level detection capability
     Threshold connected components vs CUSUM/EWMA vs heatmap detector vs F2E.
@@ -20,14 +20,17 @@ Layer 2: High-level accident diagnosis capability
     F2E events + rules
     F2E events + LLM
 
-Layer 3: Action decision capability
-    abnormal confirmation, review flagging, resampling target suggestion, and
-    low-confidence false-positive filtering.
-
 API safety
 ----------
 The script reads DASHSCOPE_API_KEY from the environment.  It never stores or
 prints the key.  API calls are optional: --api-mode offline/auto/api.
+
+Token accounting
+----------------
+DashScope/OpenAI-compatible Qwen responses are measured from the official
+``usage`` object whenever it is present.  Optional tokenizer/heuristic fallbacks
+are recorded with explicit source flags so estimated counts are never mixed with
+API-measured counts silently.
 """
 from __future__ import annotations
 
@@ -65,7 +68,7 @@ from University_Field_to_Event_Encoder import (
     nearest_free,
 )
 
-COMPARISON_VERSION = "v8.2.1"
+COMPARISON_VERSION = "v8.2.3"
 
 ACCIDENT_TYPES = [
     "fire",
@@ -151,6 +154,9 @@ def safe_mean(values: Iterable[Any]) -> Optional[float]:
             xs.append(fv)
     return float(np.mean(xs)) if xs else None
 
+def metric_ms(value: Any) -> str:
+    return "NA" if value is None else f"{value}ms"
+
 def iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     inter = int((mask_a & mask_b).sum())
     union = int((mask_a | mask_b).sum())
@@ -194,6 +200,8 @@ class AccidentScenario:
     explanation_fields: Tuple[str, ...] = ()
     target_field: Optional[str] = None
     notes: str = ""
+    challenge: str = ""
+    llm_advantage: str = ""
 
 def effect(eid: str, field_key: str, polarity: str, shape: str, center: Tuple[float, float],
            area: str = "stable", intensity: str = "stable", amp: float = 3.5,
@@ -226,6 +234,8 @@ def make_accident_scenarios(profile: str = "paper") -> List[AccidentScenario]:
             ]),
             explanation_fields=("temperature", "air_quality", "co2", "humidity"), target_field="temperature",
             notes="Fire and electrical overheating both contain high temperature; fire has AQI/CO2/humidity evidence.",
+            challenge="fire_vs_electrical_overheat",
+            llm_advantage="Both cases contain high temperature, but fire requires joint AQI/CO2/humidity reasoning.",
         ),
         AccidentScenario(
             "fire_vs_overheat__electrical", "electrical_overheat",
@@ -234,6 +244,9 @@ def make_accident_scenarios(profile: str = "paper") -> List[AccidentScenario]:
                 effect("P_elec", "pressure", "high", "point_like", (16, 15), "stable", "stable", 1.6),
             ]),
             explanation_fields=("temperature",), target_field="temperature",
+            notes="Electrical overheating is a high-temperature confuser without the air-quality and humidity signature of fire.",
+            challenge="fire_vs_electrical_overheat",
+            llm_advantage="A model should avoid calling every high-temperature event fire when combustion-side fields are absent.",
         ),
         AccidentScenario(
             "water_vs_steam__water", "water_leak",
@@ -243,6 +256,8 @@ def make_accident_scenarios(profile: str = "paper") -> List[AccidentScenario]:
             ]),
             explanation_fields=("humidity", "pressure"), target_field="humidity",
             notes="Water leak and steam leak share high humidity; steam also has temperature and pressure evidence.",
+            challenge="water_leak_vs_steam_leak",
+            llm_advantage="Both cases contain high humidity, but water leak lacks the high-temperature/high-pressure steam signature.",
         ),
         AccidentScenario(
             "water_vs_steam__steam", "steam_leak",
@@ -252,6 +267,9 @@ def make_accident_scenarios(profile: str = "paper") -> List[AccidentScenario]:
                 effect("P_steam", "pressure", "high", "compact_blob", (15, 18), "stable", "strengthening", 2.1),
             ]),
             explanation_fields=("humidity", "temperature", "pressure"), target_field="humidity",
+            notes="Steam leak is a humidity anomaly with simultaneous heat and pressure disturbance.",
+            challenge="water_leak_vs_steam_leak",
+            llm_advantage="A model should combine humidity, temperature, pressure, and trend evidence instead of using humidity alone.",
         ),
         AccidentScenario(
             "co2_vs_dust__co2", "co2_accumulation",
@@ -261,6 +279,8 @@ def make_accident_scenarios(profile: str = "paper") -> List[AccidentScenario]:
             ]),
             explanation_fields=("co2", "air_quality"), target_field="co2",
             notes="CO2 accumulation and dust pollution can both affect air quality; CO2 field separates them.",
+            challenge="co2_accumulation_vs_dust_pollution",
+            llm_advantage="Both cases can look like poor air quality, but CO2 accumulation has a CO2-specific spatial field.",
         ),
         AccidentScenario(
             "co2_vs_dust__dust", "dust_pollution",
@@ -268,6 +288,9 @@ def make_accident_scenarios(profile: str = "paper") -> List[AccidentScenario]:
                 effect("AQI_dust", "air_quality", "high", "elongated_strip", (16, 16), "expanding", "strengthening", 3.8, angle=2.1),
             ]),
             explanation_fields=("air_quality",), target_field="air_quality",
+            notes="Dust pollution is primarily a generic air-quality anomaly without a matching CO2 plume.",
+            challenge="co2_accumulation_vs_dust_pollution",
+            llm_advantage="A model should not overfit any air-quality anomaly to CO2 accumulation when CO2 evidence is absent.",
         ),
         AccidentScenario(
             "composite_fire_and_leak", "composite_anomaly",
@@ -278,6 +301,8 @@ def make_accident_scenarios(profile: str = "paper") -> List[AccidentScenario]:
             ]),
             ambiguous=True, unseen_combo=True, explanation_fields=("temperature", "air_quality", "humidity"), target_field="temperature",
             notes="Composite anomaly: traditional single-rule systems often misclassify into one incident.",
+            challenge="composite_anomaly",
+            llm_advantage="Joint fire-like and leak-like evidence should be reported as composite rather than forced into one rule label.",
         ),
         AccidentScenario(
             "low_snr_multi_field", "low_snr_anomaly",
@@ -289,6 +314,8 @@ def make_accident_scenarios(profile: str = "paper") -> List[AccidentScenario]:
             stress=StressConfig("low_snr_noise", noise_sigma=0.35, anomaly_scale=0.65),
             ambiguous=True, expected_review=True, explanation_fields=("temperature", "co2", "air_quality"), target_field="temperature",
             notes="Low SNR: a strong system should combine weak trends and may request review.",
+            challenge="low_snr_multi_field",
+            llm_advantage="Weak evidence across several fields should be integrated with calibrated uncertainty instead of hard thresholding.",
         ),
         AccidentScenario(
             "missing_low_confidence_region", "needs_review_unknown",
@@ -299,6 +326,8 @@ def make_accident_scenarios(profile: str = "paper") -> List[AccidentScenario]:
             stress=StressConfig("occlusion_40", occlusion_rate=0.40, anomaly_scale=0.75),
             ambiguous=True, expected_review=True, explanation_fields=("humidity", "temperature"), target_field="humidity",
             notes="Missing/low-confidence region should produce review rather than a brittle hard label.",
+            challenge="missing_or_low_confidence_region",
+            llm_advantage="Missing observations should trigger review/resampling instead of forcing an overconfident diagnosis.",
         ),
         AccidentScenario(
             "unseen_pressure_aqi_combo", "needs_review_unknown",
@@ -309,11 +338,16 @@ def make_accident_scenarios(profile: str = "paper") -> List[AccidentScenario]:
             ]),
             ambiguous=True, unseen_combo=True, expected_review=True, explanation_fields=("pressure", "air_quality", "humidity"), target_field="pressure",
             notes="Unseen combination tests generalization and calibrated review behavior.",
+            challenge="unseen_field_combination",
+            llm_advantage="The pattern is outside the known accident templates, so generalized reasoning should prefer review.",
         ),
         AccidentScenario(
             "normal_no_incident", "normal",
             TestCase("normal_no_incident", []),
             explanation_fields=(), target_field=None,
+            notes="Normal control case for false-positive and low-confidence filtering.",
+            challenge="normal_control",
+            llm_advantage="A model should preserve normal when no coherent multi-field evidence is present.",
         ),
     ]
     if profile == "quick":
@@ -537,6 +571,8 @@ def clone_scenario_for_grid(scenario: AccidentScenario, grid: np.ndarray) -> Acc
         explanation_fields=scenario.explanation_fields,
         target_field=scenario.target_field,
         notes=scenario.notes,
+        challenge=scenario.challenge,
+        llm_advantage=scenario.llm_advantage,
     )
 
 def field_keys_for_scenario(s: AccidentScenario, all_fields: bool = True) -> Tuple[str, ...]:
@@ -567,6 +603,43 @@ def summarize_events(events: List[Dict[str, Any]], max_events: int = 12) -> List
             "physical_tag": (ev.get("physical_tag") or {}).get("label"),
         })
     return out
+
+def diagnosis_query_t(scenario: AccidentScenario, steps: int, interval_steps: int = 50) -> int:
+    """Choose the frame whose events are sent to the LLM diagnosis layer.
+
+    This mirrors the live demo cadence: the LLM is asked every N rendered steps.
+    For abnormal cases we use the latest scheduled query inside the active
+    injection window, so the model sees the stable/strong anomaly rather than
+    the post-event final frame.
+    """
+    last_t = max(0, int(steps) - 1)
+    interval = max(1, int(interval_steps))
+    scheduled = [step_1based - 1 for step_1based in range(interval, int(steps) + 1, interval)]
+    if not scheduled:
+        scheduled = [last_t]
+    if not scenario.testcase.effects:
+        return int(scheduled[-1])
+
+    active_start = min(int(e.start) for e in scenario.testcase.effects)
+    active_end = min(int(e.end) for e in scenario.testcase.effects)
+    candidates = [t for t in scheduled if active_start <= t < active_end and t <= last_t]
+    if candidates:
+        return int(candidates[-1])
+
+    # Fallback for short runs or unusual schedules: choose a late active frame.
+    target = active_start + int(round(0.65 * max(1, active_end - active_start - 1)))
+    return int(max(0, min(last_t, target)))
+
+def snapshot_events_at(trace: RunTrace, t: int) -> List[Dict[str, Any]]:
+    for snap in trace.event_snapshots:
+        if int(snap.get("t", -1)) == int(t):
+            events = snap.get("events", [])
+            return events if isinstance(events, list) else []
+    if trace.event_snapshots:
+        nearest = min(trace.event_snapshots, key=lambda s: abs(int(s.get("t", 0)) - int(t)))
+        events = nearest.get("events", [])
+        return events if isinstance(events, list) else []
+    return []
 
 def current_field_summary(fields_by_t: List[Dict[str, np.ndarray]], free_mask: np.ndarray) -> Dict[str, Any]:
     summary: Dict[str, Any] = {}
@@ -705,6 +778,7 @@ class RunTrace:
     detector_name: str
     events_last: List[Dict[str, Any]]
     events_all: List[Dict[str, Any]]
+    event_snapshots: List[Dict[str, Any]]
     fields_window: List[Dict[str, np.ndarray]]
     fields_last: Dict[str, np.ndarray]
     grid: np.ndarray
@@ -724,14 +798,18 @@ def collect_run_trace(scenario: AccidentScenario, seed: int, steps: int, detecto
     first_det: Optional[int] = None
     events_last: List[Dict[str, Any]] = []
     events_all: List[Dict[str, Any]] = []
+    event_snapshots: List[Dict[str, Any]] = []
     fields_window: List[Dict[str, np.ndarray]] = []
     fields_last: Dict[str, np.ndarray] = {}
     gt_last: List[Dict[str, Any]] = []
+    detector_elapsed = 0.0
     t0 = time.perf_counter()
     for t in range(steps):
         rng = np.random.default_rng(seed * 1000003 + t)
         current, gt_records = build_current_fields(grid, sc.testcase, t, field_keys, stress=sc.stress, rng=rng)
+        det_t0 = time.perf_counter()
         events = detector.update(t, current)
+        detector_elapsed += time.perf_counter() - det_t0
         fields_last = current
         gt_last = gt_records
         # Keep the full episode history so the VLM baseline can receive a fair
@@ -739,7 +817,9 @@ def collect_run_trace(scenario: AccidentScenario, seed: int, steps: int, detecto
         # passed into the F2E encoder.
         fields_window.append({k: v.copy() for k, v in current.items()})
         events_last = events
-        events_all.extend([serializable_event(ev) for ev in events[:10]])
+        serial_events = [serializable_event(ev) for ev in events[:10]]
+        events_all.extend(serial_events)
+        event_snapshots.append({"t": int(t), "events": serial_events})
         matched = set()
         for gt in gt_records:
             candidates = [(idx, ev, iou(gt["mask"], ev["mask"])) for idx, ev in enumerate(events) if ev.get("field_key") == gt["field_key"] and ev.get("polarity") == gt["polarity"]]
@@ -782,8 +862,10 @@ def collect_run_trace(scenario: AccidentScenario, seed: int, steps: int, detecto
         "extra_event_fp_per_100_effect_frames": round(float(100 * fp_extra / max(1, effect_frames)), 6),
         "latency_steps": None if first_det is None or not sc.testcase.effects else int(first_det - min(e.start for e in sc.testcase.effects)),
         "latency_ms_per_frame": round(float(elapsed / max(1, steps)), 6),
+        "detector_total_latency_ms": round(float(detector_elapsed * 1000.0), 6),
+        "detector_latency_ms_per_frame": round(float(detector_elapsed * 1000.0 / max(1, steps)), 6),
     }
-    return RunTrace(sc, seed, detector_name, events_last, events_all, fields_window, fields_last, grid, gt_last, low_metrics, elapsed)
+    return RunTrace(sc, seed, detector_name, events_last, events_all, event_snapshots, fields_window, fields_last, grid, gt_last, low_metrics, elapsed)
 
 # ============================================================
 # Rule-based diagnosis and decisions
@@ -867,18 +949,6 @@ def diagnose_by_rules(events: List[Dict[str, Any]], source_name: str = "events")
         "evidence_fields": [k for k in FIELDS if high(k) or low(k)],
     }
 
-def action_from_diagnosis(diag: Dict[str, Any]) -> Dict[str, Any]:
-    label = diag.get("accident_type", "normal")
-    conf = float(diag.get("confidence", 0.0) or 0.0)
-    review = bool(diag.get("review_needed", False))
-    abnormal = label != "normal" and conf >= 0.55 and not (review and conf < 0.62)
-    return {
-        "confirm_abnormal": bool(abnormal),
-        "mark_review": bool(review or conf < 0.62 or label == "needs_review_unknown"),
-        "filter_as_low_confidence_fp": bool(label == "normal" or (conf < 0.55 and not review)),
-        "resample_target": diag.get("resample_target"),
-    }
-
 # ============================================================
 # DashScope OpenAI-compatible client
 # ============================================================
@@ -894,6 +964,18 @@ class ModelCallResult:
     model: Optional[str] = None
     error: Optional[str] = None
     from_cache: bool = False
+    usage: Dict[str, Any] = field(default_factory=dict)
+    token_count_source: str = "none"
+    token_count_is_estimate: bool = False
+    api_usage_available: bool = False
+    prompt_text_tokens: Optional[int] = None
+    prompt_image_tokens: Optional[int] = None
+    prompt_video_tokens: Optional[int] = None
+    prompt_audio_tokens: Optional[int] = None
+    prompt_cached_tokens: Optional[int] = None
+    completion_text_tokens: Optional[int] = None
+    completion_reasoning_tokens: Optional[int] = None
+    completion_audio_tokens: Optional[int] = None
 
 def usage_value(usage: Dict[str, Any], *names: str) -> Optional[int]:
     for name in names:
@@ -906,6 +988,12 @@ def usage_value(usage: Dict[str, Any], *names: str) -> Optional[int]:
             continue
     return None
 
+def usage_detail_value(usage: Dict[str, Any], detail_name: str, *names: str) -> Optional[int]:
+    detail = usage.get(detail_name)
+    if not isinstance(detail, dict):
+        return None
+    return usage_value(detail, *names)
+
 def usage_triplet(usage: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], Optional[int]]:
     prompt = usage_value(usage, "prompt_tokens", "input_tokens", "input_token_count")
     completion = usage_value(usage, "completion_tokens", "output_tokens", "output_token_count")
@@ -913,6 +1001,173 @@ def usage_triplet(usage: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], 
     if total is None and (prompt is not None or completion is not None):
         total = int(prompt or 0) + int(completion or 0)
     return prompt, completion, total
+
+def usage_token_details(usage: Dict[str, Any]) -> Dict[str, Optional[int]]:
+    return {
+        "prompt_text_tokens": usage_detail_value(usage, "prompt_tokens_details", "text_tokens"),
+        "prompt_image_tokens": usage_detail_value(usage, "prompt_tokens_details", "image_tokens"),
+        "prompt_video_tokens": usage_detail_value(usage, "prompt_tokens_details", "video_tokens"),
+        "prompt_audio_tokens": usage_detail_value(usage, "prompt_tokens_details", "audio_tokens"),
+        "prompt_cached_tokens": usage_detail_value(usage, "prompt_tokens_details", "cached_tokens"),
+        "completion_text_tokens": usage_detail_value(usage, "completion_tokens_details", "text_tokens"),
+        "completion_reasoning_tokens": usage_detail_value(usage, "completion_tokens_details", "reasoning_tokens"),
+        "completion_audio_tokens": usage_detail_value(usage, "completion_tokens_details", "audio_tokens"),
+    }
+
+def contains_visual_input(messages: Any) -> bool:
+    if isinstance(messages, dict):
+        if messages.get("type") in {"image_url", "video"}:
+            return True
+        return any(contains_visual_input(v) for v in messages.values())
+    if isinstance(messages, list):
+        return any(contains_visual_input(v) for v in messages)
+    return False
+
+def strip_visual_data_urls(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k == "url" and isinstance(v, str) and v.startswith("data:image/"):
+                out[k] = "<image_data_url_omitted>"
+            else:
+                out[k] = strip_visual_data_urls(v)
+        return out
+    if isinstance(obj, list):
+        return [strip_visual_data_urls(v) for v in obj]
+    return obj
+
+def text_messages_for_tokenizer(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    for msg in messages:
+        role = str(msg.get("role", "user"))
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+                elif isinstance(item, dict) and item.get("type") in {"image_url", "video"}:
+                    parts.append("<visual_input>")
+            text = "\n".join(p for p in parts if p)
+        else:
+            text = json.dumps(content, ensure_ascii=False)
+        out.append({"role": role, "content": text})
+    return out
+
+@dataclass
+class TokenFallbackCounter:
+    mode: str = "none"
+    tokenizer_model: Optional[str] = None
+    local_files_only: bool = True
+    _tokenizer: Any = field(default=None, init=False, repr=False)
+    _load_attempted: bool = field(default=False, init=False, repr=False)
+    _load_error: Optional[str] = field(default=None, init=False, repr=False)
+
+    def _default_tokenizer_model(self) -> str:
+        return "Qwen/Qwen3-30B-A3B-Instruct-2507"
+
+    def _load_tokenizer(self) -> Any:
+        if self._load_attempted:
+            return self._tokenizer
+        self._load_attempted = True
+        model_name = self.tokenizer_model or self._default_tokenizer_model()
+        self.tokenizer_model = model_name
+        try:
+            from transformers import AutoTokenizer  # type: ignore
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                local_files_only=self.local_files_only,
+            )
+        except Exception as e:
+            self._load_error = repr(e)
+            self._tokenizer = None
+        return self._tokenizer
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "tokenizer_model": self.tokenizer_model,
+            "local_files_only": self.local_files_only,
+            "load_attempted": self._load_attempted,
+            "load_error": self._load_error,
+        }
+
+    def count_prompt(self, messages: List[Dict[str, Any]]) -> Tuple[Optional[int], str]:
+        if self.mode == "none":
+            return None, "none"
+        if self.mode == "heuristic":
+            payload = strip_visual_data_urls(messages)
+            suffix = "_excludes_image_tokens" if contains_visual_input(messages) else ""
+            return token_estimate_from_payload(payload), "char_heuristic_estimate" + suffix
+        if self.mode == "hf_tokenizer":
+            if contains_visual_input(messages):
+                return None, "hf_tokenizer_unavailable_for_visual_input"
+            tok = self._load_tokenizer()
+            if tok is None:
+                return None, "hf_tokenizer_unavailable"
+            text_messages = text_messages_for_tokenizer(messages)
+            try:
+                ids = tok.apply_chat_template(text_messages, tokenize=True, add_generation_prompt=True)
+                return int(len(ids)), f"hf_tokenizer_estimate:{self.tokenizer_model}"
+            except Exception:
+                try:
+                    text = "\n".join(f"{m['role']}: {m['content']}" for m in text_messages)
+                    ids = tok.encode(text)
+                    return int(len(ids)), f"hf_tokenizer_encode_estimate:{self.tokenizer_model}"
+                except Exception as e:
+                    self._load_error = repr(e)
+                    return None, "hf_tokenizer_count_failed"
+        return None, "none"
+
+    def count_completion(self, payload: Any) -> Tuple[Optional[int], str]:
+        if self.mode == "none":
+            return None, "none"
+        text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+        if self.mode == "heuristic":
+            return token_estimate_from_payload(text), "char_heuristic_estimate"
+        if self.mode == "hf_tokenizer":
+            tok = self._load_tokenizer()
+            if tok is None:
+                return None, "hf_tokenizer_unavailable"
+            try:
+                ids = tok.encode(text)
+                return int(len(ids)), f"hf_tokenizer_estimate:{self.tokenizer_model}"
+            except Exception as e:
+                self._load_error = repr(e)
+                return None, "hf_tokenizer_count_failed"
+        return None, "none"
+
+def apply_token_fallback(res: ModelCallResult, messages: List[Dict[str, Any]], completion_payload: Any,
+                         token_counter: TokenFallbackCounter) -> ModelCallResult:
+    if res.prompt_tokens is not None and res.completion_tokens is not None and res.total_tokens is not None:
+        return res
+    prompt_est, prompt_source = token_counter.count_prompt(messages)
+    completion_est, completion_source = token_counter.count_completion(completion_payload)
+    filled = False
+    if res.prompt_tokens is None and prompt_est is not None:
+        res.prompt_tokens = prompt_est
+        filled = True
+    if res.completion_tokens is None and completion_est is not None:
+        res.completion_tokens = completion_est
+        filled = True
+    if res.total_tokens is None and (res.prompt_tokens is not None or res.completion_tokens is not None):
+        res.total_tokens = int(res.prompt_tokens or 0) + int(res.completion_tokens or 0)
+        filled = True
+    if filled:
+        res.token_count_is_estimate = True
+        source_parts = []
+        if prompt_est is not None:
+            source_parts.append(f"prompt={prompt_source}")
+        if completion_est is not None:
+            source_parts.append(f"completion={completion_source}")
+        if res.api_usage_available:
+            res.token_count_source = "api_usage_partial+" + ",".join(source_parts)
+        else:
+            res.token_count_source = ",".join(source_parts) or "estimate"
+    return res
 
 class DashScopeClient:
     def __init__(self, api_key: Optional[str], base_url: str, cache_path: Optional[str] = None,
@@ -959,9 +1214,29 @@ class DashScopeClient:
         key = self._cache_key(payload)
         if key in self.cache:
             c = self.cache[key]
-            return ModelCallResult(True, c.get("content", ""), c.get("parsed"), 0.0,
-                                   c.get("prompt_tokens"), c.get("completion_tokens"), c.get("total_tokens"),
-                                   c.get("model", model), from_cache=True)
+            return ModelCallResult(
+                True,
+                c.get("content", ""),
+                c.get("parsed"),
+                0.0,
+                c.get("prompt_tokens"),
+                c.get("completion_tokens"),
+                c.get("total_tokens"),
+                c.get("model", model),
+                from_cache=True,
+                usage=c.get("usage", {}) or {},
+                token_count_source=c.get("token_count_source", "cache_api_usage" if c.get("api_usage_available") else "cache_missing_usage"),
+                token_count_is_estimate=bool(c.get("token_count_is_estimate", False)),
+                api_usage_available=bool(c.get("api_usage_available", False)),
+                prompt_text_tokens=c.get("prompt_text_tokens"),
+                prompt_image_tokens=c.get("prompt_image_tokens"),
+                prompt_video_tokens=c.get("prompt_video_tokens"),
+                prompt_audio_tokens=c.get("prompt_audio_tokens"),
+                prompt_cached_tokens=c.get("prompt_cached_tokens"),
+                completion_text_tokens=c.get("completion_text_tokens"),
+                completion_reasoning_tokens=c.get("completion_reasoning_tokens"),
+                completion_audio_tokens=c.get("completion_audio_tokens"),
+            )
         req = urllib.request.Request(
             self.base_url + "/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
@@ -981,6 +1256,14 @@ class DashScopeClient:
             usage = data.get("usage", {}) or {}
             parsed = parse_json_object(content)
             prompt_tokens, completion_tokens, total_tokens = usage_triplet(usage)
+            api_usage_available = any(v is not None for v in (prompt_tokens, completion_tokens, total_tokens))
+            detail_tokens = usage_token_details(usage)
+            if api_usage_available:
+                token_count_source = "api_usage"
+            elif usage:
+                token_count_source = "api_usage_without_standard_counts"
+            else:
+                token_count_source = "missing_api_usage"
             cache_val = {
                 "content": content,
                 "parsed": parsed,
@@ -988,12 +1271,29 @@ class DashScopeClient:
                 "completion_tokens": completion_tokens,
                 "total_tokens": total_tokens,
                 "model": data.get("model", model),
+                "usage": usage,
+                "token_count_source": token_count_source,
+                "token_count_is_estimate": False,
+                "api_usage_available": api_usage_available,
+                **detail_tokens,
             }
             self.cache[key] = cache_val
             self._save_cache()
-            return ModelCallResult(True, content, parsed, latency,
-                                   prompt_tokens, completion_tokens, total_tokens,
-                                   data.get("model", model))
+            return ModelCallResult(
+                True,
+                content,
+                parsed,
+                latency,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                data.get("model", model),
+                usage=usage,
+                token_count_source=token_count_source,
+                token_count_is_estimate=False,
+                api_usage_available=api_usage_available,
+                **detail_tokens,
+            )
         except urllib.error.HTTPError as e:
             err = e.read().decode("utf-8", errors="replace")[:1000]
             return ModelCallResult(False, "", None, (time.perf_counter() - t0) * 1000, error=f"HTTP {e.code}: {err}")
@@ -1093,6 +1393,8 @@ def run_layer1(scenarios: List[AccidentScenario], seeds: int, steps: int, obs_ra
                     "detector": det,
                     "ambiguous": sc.ambiguous,
                     "unseen_combo": sc.unseen_combo,
+                    "expected_review": sc.expected_review,
+                    "challenge": sc.challenge,
                     **trace.low_metrics,
                 }
                 rows.append(row)
@@ -1122,11 +1424,13 @@ def aggregate_layer1(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "extra_event_fp_per_100_effect_frames": round(float(safe_mean([r.get("extra_event_fp_per_100_effect_frames") for r in rs])), 6) if safe_mean([r.get("extra_event_fp_per_100_effect_frames") for r in rs]) is not None else None,
             "latency_steps": round(float(safe_mean([r.get("latency_steps") for r in rs])), 6) if safe_mean([r.get("latency_steps") for r in rs]) is not None else None,
             "latency_ms_per_frame": round(float(safe_mean([r.get("latency_ms_per_frame") for r in rs])), 6) if safe_mean([r.get("latency_ms_per_frame") for r in rs]) is not None else None,
+            "detector_total_latency_ms": round(float(safe_mean([r.get("detector_total_latency_ms") for r in rs])), 6) if safe_mean([r.get("detector_total_latency_ms") for r in rs]) is not None else None,
+            "detector_latency_ms_per_frame": round(float(safe_mean([r.get("detector_latency_ms_per_frame") for r in rs])), 6) if safe_mean([r.get("detector_latency_ms_per_frame") for r in rs]) is not None else None,
         })
     return out
 
 # ============================================================
-# Layers 2 and 3
+# Layer 2 diagnosis
 # ============================================================
 def normalize_diag(diag: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not isinstance(diag, dict):
@@ -1156,102 +1460,120 @@ def explanation_score(diag: Dict[str, Any], scenario: AccidentScenario) -> float
     hits = sum(1 for f in req if f.lower() in text)
     return hits / max(1, len(req))
 
-def resample_success(diag: Dict[str, Any], scenario: AccidentScenario, gt_last: List[Dict[str, Any]]) -> Optional[float]:
-    target = diag.get("resample_target")
-    if not scenario.testcase.effects:
-        return None
-    if target is None:
-        return 0.0
-    centroid = target.get("centroid") if isinstance(target, dict) else None
-    field_key = target.get("field_key") if isinstance(target, dict) else None
-    if centroid is None or not isinstance(centroid, (list, tuple)) or len(centroid) != 2:
-        return 0.0
-    try:
-        c = (float(centroid[0]), float(centroid[1]))
-    except Exception:
-        return 0.0
-    candidates = [g for g in gt_last if field_key is None or g.get("field_key") == field_key]
-    if not candidates:
-        candidates = gt_last
-    if not candidates:
-        return 0.0
-    best = min(centroid_error(c, g["centroid"]) for g in candidates)
-    return 1.0 if best <= 5.0 else 0.0
-
 def token_estimate_from_payload(payload: Any) -> int:
-    # Coarse, reproducible proxy when API usage is unavailable.
+    # Coarse proxy used only when explicitly requested through --token-fallback.
     return max(1, int(len(json.dumps(payload, ensure_ascii=False)) / 4))
 
 def call_or_offline(client: DashScopeClient, api_mode: str, model: str, messages: List[Dict[str, Any]],
-                    offline_payload: Dict[str, Any], mode: str, max_tokens: int = 512) -> ModelCallResult:
+                    offline_payload: Dict[str, Any], mode: str, token_counter: TokenFallbackCounter,
+                    max_tokens: int = 512) -> ModelCallResult:
     use_api = api_mode == "api" or (api_mode == "auto" and bool(client.api_key))
     if not use_api:
+        t0 = time.perf_counter()
         parsed = offline_llm_proxy(offline_payload, mode)
-        return ModelCallResult(True, json.dumps(parsed, ensure_ascii=False), parsed, 0.0,
-                               prompt_tokens=token_estimate_from_payload(messages), completion_tokens=token_estimate_from_payload(parsed),
-                               total_tokens=token_estimate_from_payload(messages) + token_estimate_from_payload(parsed), model="offline_proxy")
+        res = ModelCallResult(
+            True,
+            json.dumps(parsed, ensure_ascii=False),
+            parsed,
+            (time.perf_counter() - t0) * 1000.0,
+            model="offline_proxy",
+            token_count_source="offline_no_api_usage",
+        )
+        return apply_token_fallback(res, messages, parsed, token_counter)
     res = client.call(model, messages, max_tokens=max_tokens, temperature=0.0)
     if res.ok and res.parsed:
-        # Some DashScope-compatible responses omit OpenAI-style usage fields or
-        # use model-specific names.  Keep the raw parsed result, but fill a
-        # reproducible proxy so token/cost columns are never empty.
-        if res.prompt_tokens is None:
-            res.prompt_tokens = token_estimate_from_payload(messages)
-        if res.completion_tokens is None:
-            res.completion_tokens = token_estimate_from_payload(res.parsed)
-        if res.total_tokens is None:
-            res.total_tokens = int(res.prompt_tokens or 0) + int(res.completion_tokens or 0)
-        return res
+        return apply_token_fallback(res, messages, res.parsed, token_counter)
     # Preserve the API error while making the pipeline complete.
     parsed = offline_llm_proxy(offline_payload, mode)
     parsed["explanation"] = "API call failed; offline fallback used for pipeline continuity. " + parsed.get("explanation", "")
-    prompt_tokens = res.prompt_tokens if res.prompt_tokens is not None else token_estimate_from_payload(messages)
-    completion_tokens = res.completion_tokens if res.completion_tokens is not None else token_estimate_from_payload(parsed)
-    total_tokens = res.total_tokens if res.total_tokens is not None else int(prompt_tokens or 0) + int(completion_tokens or 0)
-    return ModelCallResult(False, json.dumps(parsed, ensure_ascii=False), parsed, res.latency_ms,
-                           prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, total_tokens=total_tokens,
-                           model=res.model or model, error=res.error)
+    fallback_res = ModelCallResult(
+        False,
+        json.dumps(parsed, ensure_ascii=False),
+        parsed,
+        res.latency_ms,
+        prompt_tokens=res.prompt_tokens,
+        completion_tokens=res.completion_tokens,
+        total_tokens=res.total_tokens,
+        model=res.model or model,
+        error=res.error,
+        from_cache=res.from_cache,
+        usage=res.usage,
+        token_count_source=res.token_count_source,
+        token_count_is_estimate=res.token_count_is_estimate,
+        api_usage_available=res.api_usage_available,
+        prompt_text_tokens=res.prompt_text_tokens,
+        prompt_image_tokens=res.prompt_image_tokens,
+        prompt_video_tokens=res.prompt_video_tokens,
+        prompt_audio_tokens=res.prompt_audio_tokens,
+        prompt_cached_tokens=res.prompt_cached_tokens,
+        completion_text_tokens=res.completion_text_tokens,
+        completion_reasoning_tokens=res.completion_reasoning_tokens,
+        completion_audio_tokens=res.completion_audio_tokens,
+    )
+    return apply_token_fallback(fallback_res, messages, parsed, token_counter)
 
 def build_method_inputs(trace_threshold: RunTrace, trace_f2e: RunTrace, image_dir: str,
-                        vlm_frame_mode: str = "sampled", vlm_num_frames: int = 8) -> Dict[str, Dict[str, Any]]:
-    th_events = summarize_events(trace_threshold.events_last)
-    f2e_events = summarize_events(trace_f2e.events_last)
-    matrix_summary = current_field_summary(trace_f2e.fields_window, trace_f2e.grid == 0)
+                        vlm_frame_mode: str = "sampled", vlm_num_frames: int = 8,
+                        llm_interval_steps: int = 50) -> Dict[str, Dict[str, Any]]:
+    diag_t = diagnosis_query_t(trace_f2e.scenario, len(trace_f2e.fields_window), llm_interval_steps)
+    th_events = summarize_events(snapshot_events_at(trace_threshold, diag_t))
+    f2e_events = summarize_events(snapshot_events_at(trace_f2e, diag_t))
+    fields_for_diagnosis = trace_f2e.fields_window[:diag_t + 1] or trace_f2e.fields_window
+    fields_at_diagnosis = fields_for_diagnosis[-1] if fields_for_diagnosis else trace_f2e.fields_last
+    matrix_t0 = time.perf_counter()
+    matrix_summary = current_field_summary(fields_for_diagnosis, trace_f2e.grid == 0)
+    matrix_latency_ms = (time.perf_counter() - matrix_t0) * 1000.0
     img_path: Optional[str]
     frame_indices: List[int]
+    image_render_latency_ms = 0.0
     if vlm_frame_mode == "last":
+        image_t0 = time.perf_counter()
         img_path = render_fields_image(
-            trace_f2e.fields_last,
+            fields_at_diagnosis,
             os.path.join(image_dir, f"{trace_f2e.scenario.scenario_id}_seed{trace_f2e.seed}_last.png"),
             trace_f2e.scenario.scenario_id,
         )
-        frame_indices = [len(trace_f2e.fields_window) - 1]
+        image_render_latency_ms = (time.perf_counter() - image_t0) * 1000.0
+        frame_indices = [int(diag_t)]
     else:
+        image_t0 = time.perf_counter()
         img_path, frame_indices = render_fields_contact_sheet(
-            trace_f2e.fields_window,
+            fields_for_diagnosis,
             os.path.join(image_dir, f"{trace_f2e.scenario.scenario_id}_seed{trace_f2e.seed}_{vlm_frame_mode}{vlm_num_frames}.png"),
             trace_f2e.scenario.scenario_id,
             mode=vlm_frame_mode,
             num_frames=vlm_num_frames,
         )
+        image_render_latency_ms = (time.perf_counter() - image_t0) * 1000.0
+    prep_latency = {
+        "threshold_events": float(trace_threshold.low_metrics.get("detector_total_latency_ms") or 0.0),
+        "f2e_events": float(trace_f2e.low_metrics.get("detector_total_latency_ms") or 0.0),
+        "raw_matrix_summary": float(matrix_latency_ms),
+        "raw_field_image": float(matrix_latency_ms + image_render_latency_ms),
+    }
     return {
-        "threshold_events": {"events": th_events},
-        "f2e_events": {"events": f2e_events},
-        "raw_matrix_summary": {"field_summary": matrix_summary},
+        "diagnosis_t": {"t": int(diag_t), "llm_interval_steps": int(llm_interval_steps)},
+        "threshold_events": {"events": th_events, "representation_latency_ms": prep_latency["threshold_events"], "diagnosis_t": int(diag_t)},
+        "f2e_events": {"events": f2e_events, "representation_latency_ms": prep_latency["f2e_events"], "diagnosis_t": int(diag_t)},
+        "raw_matrix_summary": {"field_summary": matrix_summary, "representation_latency_ms": prep_latency["raw_matrix_summary"]},
         "raw_field_image": {
             "field_summary": matrix_summary,
             "image_path": img_path,
+            "diagnosis_t": int(diag_t),
             "vlm_frame_mode": vlm_frame_mode,
             "vlm_frame_indices": frame_indices,
+            "representation_latency_ms": prep_latency["raw_field_image"],
+            "matrix_summary_latency_ms": matrix_latency_ms,
+            "image_render_latency_ms": image_render_latency_ms,
         },
     }
 
-def run_layers23(scenarios: List[AccidentScenario], seeds: int, steps: int, obs_ratio: float, base_seed: int,
-                 out_dir: str, api_mode: str, client: DashScopeClient, llm_model: str, vlm_model: str,
-                 progress: ProgressMeter, start_job: int, vlm_frame_mode: str = "sampled",
-                 vlm_num_frames: int = 8) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
+def run_layer2(scenarios: List[AccidentScenario], seeds: int, steps: int, obs_ratio: float, base_seed: int,
+               out_dir: str, api_mode: str, client: DashScopeClient, llm_model: str, vlm_model: str,
+               progress: ProgressMeter, start_job: int, vlm_frame_mode: str = "sampled",
+               vlm_num_frames: int = 8, llm_interval_steps: int = 50,
+               token_counter: Optional[TokenFallbackCounter] = None) -> Tuple[List[Dict[str, Any]], int]:
     diag_rows: List[Dict[str, Any]] = []
-    action_rows: List[Dict[str, Any]] = []
     job = start_job
     methods = [
         "threshold_events_rules",
@@ -1262,56 +1584,99 @@ def run_layers23(scenarios: List[AccidentScenario], seeds: int, steps: int, obs_
         "f2e_events_llm",
     ]
     image_dir = os.path.join(out_dir, "field_images")
+    token_counter = token_counter or TokenFallbackCounter()
     for epi in range(seeds):
         for sc_idx, sc in enumerate(scenarios):
             seed = base_seed + 2000000 + 100000 * epi + 1000 * sc_idx
             trace_threshold = collect_run_trace(sc, seed, steps, "threshold_cc", obs_ratio, all_fields=True)
             trace_f2e = collect_run_trace(sc, seed, steps, "f2e_encoder", obs_ratio, all_fields=True)
-            method_inputs = build_method_inputs(trace_threshold, trace_f2e, image_dir, vlm_frame_mode, vlm_num_frames)
+            method_inputs = build_method_inputs(trace_threshold, trace_f2e, image_dir, vlm_frame_mode, vlm_num_frames, llm_interval_steps)
+            diag_t = int((method_inputs.get("diagnosis_t") or {}).get("t", steps - 1))
+            f2e_history_frames = diag_t + 1
             for method in methods:
-                call_res = ModelCallResult(True, "", {}, 0.0, 0, 0, 0, model="rules")
+                method_t0 = time.perf_counter()
+                representation_latency_ms = 0.0
+                call_res = ModelCallResult(True, "", {}, 0.0, 0, 0, 0, model="rules", token_count_source="not_applicable_rules")
                 if method == "threshold_events_rules":
+                    representation_latency_ms = float(method_inputs["threshold_events"].get("representation_latency_ms") or 0.0)
                     diag = diagnose_by_rules(method_inputs["threshold_events"]["events"], source_name="threshold_events")
                 elif method == "f2e_events_rules":
+                    representation_latency_ms = float(method_inputs["f2e_events"].get("representation_latency_ms") or 0.0)
                     diag = diagnose_by_rules(method_inputs["f2e_events"]["events"], source_name="f2e_events")
                 elif method == "threshold_events_llm":
-                    payload = {"events": method_inputs["threshold_events"]["events"], "observation_representation": "threshold_connected_component_events"}
+                    representation_latency_ms = float(method_inputs["threshold_events"].get("representation_latency_ms") or 0.0)
+                    payload = {
+                        "events": method_inputs["threshold_events"]["events"],
+                        "observation_representation": "threshold_connected_component_events",
+                        "diagnosis_t": diag_t,
+                        "history_frames_processed": f2e_history_frames,
+                    }
                     messages = build_diagnosis_prompt("threshold_events", payload)
-                    call_res = call_or_offline(client, api_mode, llm_model, messages, payload, "threshold_events_llm")
+                    call_res = call_or_offline(client, api_mode, llm_model, messages, payload, "threshold_events_llm", token_counter)
                     diag = normalize_diag(call_res.parsed)
                 elif method == "f2e_events_llm":
-                    payload = {"events": method_inputs["f2e_events"]["events"], "observation_representation": "F2E_structured_event_tokens"}
+                    representation_latency_ms = float(method_inputs["f2e_events"].get("representation_latency_ms") or 0.0)
+                    payload = {
+                        "events": method_inputs["f2e_events"]["events"],
+                        "observation_representation": "F2E_structured_event_tokens",
+                        "diagnosis_t": diag_t,
+                        "history_frames_processed": f2e_history_frames,
+                    }
                     messages = build_diagnosis_prompt("f2e_events", payload)
-                    call_res = call_or_offline(client, api_mode, llm_model, messages, payload, "f2e_events_llm")
+                    call_res = call_or_offline(client, api_mode, llm_model, messages, payload, "f2e_events_llm", token_counter)
                     diag = normalize_diag(call_res.parsed)
                 elif method == "raw_matrix_summary_llm":
-                    payload = {"field_summary": method_inputs["raw_matrix_summary"]["field_summary"], "observation_representation": "raw_matrix_statistical_summary"}
+                    representation_latency_ms = float(method_inputs["raw_matrix_summary"].get("representation_latency_ms") or 0.0)
+                    payload = {
+                        "field_summary": method_inputs["raw_matrix_summary"]["field_summary"],
+                        "observation_representation": "raw_matrix_statistical_summary",
+                        "diagnosis_t": diag_t,
+                        "history_frames_observed": f2e_history_frames,
+                    }
                     messages = build_diagnosis_prompt("raw_matrix_summary", payload)
-                    call_res = call_or_offline(client, api_mode, llm_model, messages, payload, "raw_matrix_summary_llm")
+                    call_res = call_or_offline(client, api_mode, llm_model, messages, payload, "raw_matrix_summary_llm", token_counter)
                     diag = normalize_diag(call_res.parsed)
                 elif method == "raw_field_image_vlm":
+                    representation_latency_ms = float(method_inputs["raw_field_image"].get("representation_latency_ms") or 0.0)
                     img_path = method_inputs["raw_field_image"].get("image_path")
                     payload = {
                         "field_summary": method_inputs["raw_field_image"]["field_summary"],
                         "observation_representation": "raw_field_image_temporal_contact_sheet",
+                        "diagnosis_t": diag_t,
+                        "history_frames_observed": f2e_history_frames,
                         "vlm_frame_mode": method_inputs["raw_field_image"].get("vlm_frame_mode"),
                         "vlm_frame_indices": method_inputs["raw_field_image"].get("vlm_frame_indices"),
                     }
                     if img_path and os.path.exists(img_path):
                         messages = build_vlm_messages(image_to_data_url(img_path), payload)
-                        call_res = call_or_offline(client, api_mode, vlm_model, messages, payload, "raw_field_image_vlm", max_tokens=512)
+                        call_res = call_or_offline(client, api_mode, vlm_model, messages, payload, "raw_field_image_vlm", token_counter, max_tokens=512)
                         diag = normalize_diag(call_res.parsed)
                     else:
                         parsed = offline_llm_proxy(payload, "raw_field_image_vlm_no_matplotlib")
-                        call_res = ModelCallResult(True, json.dumps(parsed), parsed, 0.0, prompt_tokens=token_estimate_from_payload(payload), completion_tokens=token_estimate_from_payload(parsed), total_tokens=token_estimate_from_payload(payload)+token_estimate_from_payload(parsed), model="offline_proxy")
+                        call_res = ModelCallResult(
+                            True,
+                            json.dumps(parsed),
+                            parsed,
+                            0.0,
+                            model="offline_proxy",
+                            token_count_source="offline_no_image_usage",
+                        )
+                        call_res = apply_token_fallback(call_res, build_diagnosis_prompt("raw_field_image_missing", payload), parsed, token_counter)
                         diag = normalize_diag(parsed)
                 else:
                     raise ValueError(method)
+                diagnosis_wall_ms = (time.perf_counter() - method_t0) * 1000.0
+                end_to_end_latency_ms = representation_latency_ms + diagnosis_wall_ms
+                measured_api_latency_ms = None if call_res.from_cache or call_res.model in {"rules", "offline_proxy"} else call_res.latency_ms
 
-                action = action_from_diagnosis(diag)
                 exp_score = explanation_score(diag, sc)
-                resamp = resample_success(diag, sc, trace_f2e.gt_last)
                 correct = int(diag.get("accident_type") == sc.accident_type)
+                if method.startswith("threshold_events"):
+                    input_event_count = len(method_inputs["threshold_events"]["events"])
+                elif method.startswith("f2e_events"):
+                    input_event_count = len(method_inputs["f2e_events"]["events"])
+                else:
+                    input_event_count = None
                 diag_rows.append({
                     "layer": "high_level_diagnosis",
                     "seed_index": epi,
@@ -1324,39 +1689,42 @@ def run_layers23(scenarios: List[AccidentScenario], seeds: int, steps: int, obs_
                     "ambiguous": sc.ambiguous,
                     "unseen_combo": sc.unseen_combo,
                     "expected_review": sc.expected_review,
+                    "challenge": sc.challenge,
+                    "diagnosis_t": diag_t,
+                    "llm_interval_steps": int(llm_interval_steps),
+                    "f2e_history_frames": f2e_history_frames,
+                    "input_event_count": input_event_count,
                     "review_needed": diag.get("review_needed"),
                     "confidence": diag.get("confidence"),
                     "explanation_correctness": round(float(exp_score), 6),
                     "prompt_tokens": call_res.prompt_tokens,
                     "completion_tokens": call_res.completion_tokens,
                     "total_tokens": call_res.total_tokens,
+                    "token_count_source": call_res.token_count_source,
+                    "token_count_is_estimate": int(call_res.token_count_is_estimate),
+                    "api_usage_available": int(call_res.api_usage_available),
+                    "prompt_text_tokens": call_res.prompt_text_tokens,
+                    "prompt_image_tokens": call_res.prompt_image_tokens,
+                    "prompt_video_tokens": call_res.prompt_video_tokens,
+                    "prompt_audio_tokens": call_res.prompt_audio_tokens,
+                    "prompt_cached_tokens": call_res.prompt_cached_tokens,
+                    "completion_text_tokens": call_res.completion_text_tokens,
+                    "completion_reasoning_tokens": call_res.completion_reasoning_tokens,
+                    "completion_audio_tokens": call_res.completion_audio_tokens,
                     "api_latency_ms": round(float(call_res.latency_ms), 3),
+                    "measured_api_latency_ms": None if measured_api_latency_ms is None else round(float(measured_api_latency_ms), 3),
+                    "diagnosis_wall_ms": round(float(diagnosis_wall_ms), 3),
+                    "representation_latency_ms": round(float(representation_latency_ms), 3),
+                    "end_to_end_latency_ms": round(float(end_to_end_latency_ms), 3),
                     "model": call_res.model,
                     "from_cache": call_res.from_cache,
                     "api_ok": call_res.ok,
                     "api_error": call_res.error,
                     "explanation": diag.get("explanation"),
                 })
-                is_actionable_gt = sc.accident_type not in {"normal", "needs_review_unknown"}
-                action_rows.append({
-                    "layer": "action_decision",
-                    "seed_index": epi,
-                    "seed": seed,
-                    "scenario_id": sc.scenario_id,
-                    "method": method,
-                    "ground_truth": sc.accident_type,
-                    "is_actionable_gt": int(is_actionable_gt),
-                    "confirm_abnormal": int(action["confirm_abnormal"]),
-                    "mark_review": int(action["mark_review"]),
-                    "expected_review": int(sc.expected_review),
-                    "filter_as_low_confidence_fp": int(action["filter_as_low_confidence_fp"]),
-                    "resampling_success": resamp,
-                    "diagnosis_latency_ms": round(float(call_res.latency_ms), 3),
-                    "total_tokens": call_res.total_tokens,
-                })
                 job += 1
-                progress.update(job, f"L2/L3 seed={epi+1}/{seeds} scenario={sc.scenario_id} method={method}")
-    return diag_rows, action_rows, job
+                progress.update(job, f"L2 seed={epi+1}/{seeds} scenario={sc.scenario_id} method={method}")
+    return diag_rows, job
 
 def aggregate_layer2(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     groups: Dict[str, List[Dict[str, Any]]] = {}
@@ -1372,6 +1740,9 @@ def aggregate_layer2(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         composite = [r for r in rs if r.get("ground_truth") == "composite_anomaly"]
         low_snr = [r for r in rs if r.get("ground_truth") == "low_snr_anomaly"]
         expected_review = [r for r in rs if r.get("expected_review")]
+        api_usage_rows = [r for r in rs if r.get("api_usage_available")]
+        estimated_rows = [r for r in rs if r.get("token_count_is_estimate")]
+        uncached_api_rows = [r for r in rs if r.get("measured_api_latency_ms") is not None]
         out.append({
             "method": method,
             "n": len(rs),
@@ -1387,38 +1758,21 @@ def aggregate_layer2(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "mean_prompt_tokens": round(float(safe_mean([r.get("prompt_tokens") for r in rs])), 3) if safe_mean([r.get("prompt_tokens") for r in rs]) is not None else None,
             "mean_completion_tokens": round(float(safe_mean([r.get("completion_tokens") for r in rs])), 3) if safe_mean([r.get("completion_tokens") for r in rs]) is not None else None,
             "mean_total_tokens": round(float(safe_mean([r.get("total_tokens") for r in rs])), 3) if safe_mean([r.get("total_tokens") for r in rs]) is not None else None,
+            "mean_total_tokens_api_only": round(float(safe_mean([r.get("total_tokens") for r in api_usage_rows])), 3) if safe_mean([r.get("total_tokens") for r in api_usage_rows]) is not None else None,
+            "mean_total_tokens_estimated_only": round(float(safe_mean([r.get("total_tokens") for r in estimated_rows])), 3) if safe_mean([r.get("total_tokens") for r in estimated_rows]) is not None else None,
+            "api_usage_rate": round(float(np.mean([1 if r.get("api_usage_available") else 0 for r in rs])), 6) if rs else None,
+            "token_estimate_rate": round(float(np.mean([1 if r.get("token_count_is_estimate") else 0 for r in rs])), 6) if rs else None,
+            "mean_prompt_text_tokens": round(float(safe_mean([r.get("prompt_text_tokens") for r in rs])), 3) if safe_mean([r.get("prompt_text_tokens") for r in rs]) is not None else None,
+            "mean_prompt_image_tokens": round(float(safe_mean([r.get("prompt_image_tokens") for r in rs])), 3) if safe_mean([r.get("prompt_image_tokens") for r in rs]) is not None else None,
+            "mean_prompt_cached_tokens": round(float(safe_mean([r.get("prompt_cached_tokens") for r in rs])), 3) if safe_mean([r.get("prompt_cached_tokens") for r in rs]) is not None else None,
+            "mean_completion_reasoning_tokens": round(float(safe_mean([r.get("completion_reasoning_tokens") for r in rs])), 3) if safe_mean([r.get("completion_reasoning_tokens") for r in rs]) is not None else None,
             "mean_api_latency_ms": round(float(safe_mean([r.get("api_latency_ms") for r in rs])), 3) if safe_mean([r.get("api_latency_ms") for r in rs]) is not None else None,
+            "mean_measured_api_latency_ms": round(float(safe_mean([r.get("measured_api_latency_ms") for r in uncached_api_rows])), 3) if safe_mean([r.get("measured_api_latency_ms") for r in uncached_api_rows]) is not None else None,
+            "mean_diagnosis_wall_ms": round(float(safe_mean([r.get("diagnosis_wall_ms") for r in rs])), 3) if safe_mean([r.get("diagnosis_wall_ms") for r in rs]) is not None else None,
+            "mean_representation_latency_ms": round(float(safe_mean([r.get("representation_latency_ms") for r in rs])), 3) if safe_mean([r.get("representation_latency_ms") for r in rs]) is not None else None,
+            "mean_end_to_end_latency_ms": round(float(safe_mean([r.get("end_to_end_latency_ms") for r in rs])), 3) if safe_mean([r.get("end_to_end_latency_ms") for r in rs]) is not None else None,
+            "cache_hit_rate": round(float(np.mean([1 if r.get("from_cache") else 0 for r in rs])), 6) if rs else None,
             "api_success_rate": round(float(np.mean([1 if r.get("api_ok") else 0 for r in rs])), 6) if rs else None,
-        })
-    return out
-
-def aggregate_layer3(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    groups: Dict[str, List[Dict[str, Any]]] = {}
-    for r in rows:
-        groups.setdefault(r["method"], []).append(r)
-    out = []
-    for method, rs in sorted(groups.items()):
-        tp_action = sum(1 for r in rs if r["confirm_abnormal"] and r["is_actionable_gt"])
-        fp_action = sum(1 for r in rs if r["confirm_abnormal"] and not r["is_actionable_gt"])
-        fn_action = sum(1 for r in rs if (not r["confirm_abnormal"]) and r["is_actionable_gt"])
-        p, rec, _ = precision_recall_f1(tp_action, fp_action, fn_action)
-        review_rows = [r for r in rs if r["mark_review"]]
-        expected_review_rows = [r for r in rs if r["expected_review"]]
-        review_precision = sum(1 for r in review_rows if r["expected_review"]) / len(review_rows) if review_rows else None
-        review_recall = sum(1 for r in expected_review_rows if r["mark_review"]) / len(expected_review_rows) if expected_review_rows else None
-        active_steps = len(rs)
-        false_positive_active = fp_action / max(1, active_steps)
-        out.append({
-            "method": method,
-            "n": len(rs),
-            "actionable_precision": round(float(p), 6) if p is not None else None,
-            "actionable_recall": round(float(rec), 6) if rec is not None else None,
-            "false_positives_per_active_step": round(float(false_positive_active), 6),
-            "review_precision": round(float(review_precision), 6) if review_precision is not None else None,
-            "review_recall": round(float(review_recall), 6) if review_recall is not None else None,
-            "resampling_success_rate": round(float(safe_mean([r.get("resampling_success") for r in rs])), 6) if safe_mean([r.get("resampling_success") for r in rs]) is not None else None,
-            "diagnosis_latency_ms": round(float(safe_mean([r.get("diagnosis_latency_ms") for r in rs])), 3) if safe_mean([r.get("diagnosis_latency_ms") for r in rs]) is not None else None,
-            "mean_total_tokens": round(float(safe_mean([r.get("total_tokens") for r in rs])), 3) if safe_mean([r.get("total_tokens") for r in rs]) is not None else None,
         })
     return out
 
@@ -1427,36 +1781,44 @@ def aggregate_layer3(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # ============================================================
 def parse_layers(text: str) -> List[int]:
     if text == "all":
-        return [1, 2, 3]
+        return [1, 2]
     out = []
     for part in text.split(","):
         part = part.strip()
         if not part:
             continue
         val = int(part)
-        if val not in {1, 2, 3}:
-            raise ValueError("layers must be all or comma-separated values from 1,2,3")
+        if val not in {1, 2}:
+            raise ValueError("layers must be all or comma-separated values from 1,2")
         out.append(val)
     return sorted(set(out))
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=f"{COMPARISON_VERSION} comprehensive F2E/LLM/VLM comparison experiments")
     ap.add_argument("--profile", choices=["quick", "paper", "hard"], default="quick")
-    ap.add_argument("--layers", default="all", help="all or comma-separated subset: 1,2,3")
+    ap.add_argument("--layers", default="all", help="all or comma-separated subset: 1,2")
     ap.add_argument("--seeds", type=int, default=None)
     ap.add_argument("--steps", type=int, default=None)
     ap.add_argument("--max-scenarios", type=int, default=None)
     ap.add_argument("--obs-ratio", type=float, default=DEFAULT_OBS_RATIO)
     ap.add_argument("--seed", type=int, default=2026)
-    ap.add_argument("--out-dir", type=str, default="outputs/comprehensive_v8_2_1")
+    ap.add_argument("--out-dir", type=str, default="outputs/comprehensive_v8_2_3")
     ap.add_argument("--api-mode", choices=["offline", "auto", "api"], default="auto", help="offline: no API; auto: call API only if key exists; api: require/call API")
     ap.add_argument("--llm-model", default="qwen3.6-flash", help="model for text/event/matrix LLM comparisons")
     ap.add_argument("--vlm-model", default="qwen3-vl-flash", help="model for raw image + VLM comparison")
     ap.add_argument("--vlm-frame-mode", choices=["last", "sampled", "all"], default="sampled", help="raw_field_image+VLM input: last frame, sampled contact sheet, or all-frame contact sheet")
     ap.add_argument("--vlm-num-frames", type=int, default=8, help="number of sampled frames for --vlm-frame-mode sampled")
+    ap.add_argument("--llm-interval-steps", type=int, default=50,
+                    help="Layer 2 diagnosis query cadence, matching the live F2E+LLM demo. The LLM receives F2E events from this scheduled frame after F2E has processed all prior frames.")
     ap.add_argument("--dashscope-base-url", default=os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"))
     ap.add_argument("--enable-thinking", action="store_true", help="enable DashScope thinking mode. Default off for fair latency/token comparison.")
     ap.add_argument("--api-timeout", type=float, default=60.0)
+    ap.add_argument("--token-fallback", choices=["none", "hf_tokenizer", "heuristic"], default="none",
+                    help="Fallback token counting only when API usage is missing. Default none keeps token metrics API-measured only.")
+    ap.add_argument("--tokenizer-model", default=None,
+                    help="HuggingFace tokenizer id/path for --token-fallback hf_tokenizer. Defaults to a Qwen3 tokenizer surrogate.")
+    ap.add_argument("--tokenizer-allow-download", action="store_true",
+                    help="Allow transformers to download tokenizer files if they are not already cached locally.")
     ap.add_argument("--progress", choices=["on", "off"], default="on")
     ap.add_argument("--progress-interval", type=float, default=2.0)
     args = ap.parse_args()
@@ -1472,7 +1834,7 @@ def main() -> None:
     total_jobs = 0
     if 1 in layers:
         total_jobs += seeds * len(scenarios) * len(detector_names)
-    if 2 in layers or 3 in layers:
+    if 2 in layers:
         total_jobs += seeds * len(scenarios) * 6
     progress = ProgressMeter(total_jobs, enabled=args.progress == "on", interval_sec=args.progress_interval)
 
@@ -1488,24 +1850,27 @@ def main() -> None:
         enable_thinking=args.enable_thinking,
         timeout=args.api_timeout,
     )
+    token_counter = TokenFallbackCounter(
+        mode=args.token_fallback,
+        tokenizer_model=args.tokenizer_model,
+        local_files_only=not args.tokenizer_allow_download,
+    )
 
     t0 = time.perf_counter()
     job = 0
     layer1_rows: List[Dict[str, Any]] = []
     layer2_rows: List[Dict[str, Any]] = []
-    layer3_rows: List[Dict[str, Any]] = []
     progress.update(0, "starting")
     if 1 in layers:
         layer1_rows, job = run_layer1(scenarios, seeds, steps, args.obs_ratio, args.seed, detector_names, progress, job)
-    if 2 in layers or 3 in layers:
-        layer2_rows, layer3_rows, job = run_layers23(scenarios, seeds, steps, args.obs_ratio, args.seed, args.out_dir,
-                                                     args.api_mode, client, args.llm_model, args.vlm_model, progress, job,
-                                                     args.vlm_frame_mode, args.vlm_num_frames)
+    if 2 in layers:
+        layer2_rows, job = run_layer2(scenarios, seeds, steps, args.obs_ratio, args.seed, args.out_dir,
+                                      args.api_mode, client, args.llm_model, args.vlm_model, progress, job,
+                                      args.vlm_frame_mode, args.vlm_num_frames, args.llm_interval_steps, token_counter)
     progress.update(total_jobs, "done")
 
     layer1_summary = aggregate_layer1(layer1_rows) if layer1_rows else []
     layer2_summary = aggregate_layer2(layer2_rows) if layer2_rows else []
-    layer3_summary = aggregate_layer3(layer3_rows) if layer3_rows else []
 
     run_config = {
         "version": COMPARISON_VERSION,
@@ -1523,8 +1888,27 @@ def main() -> None:
         "vlm_model": args.vlm_model,
         "vlm_frame_mode": args.vlm_frame_mode,
         "vlm_num_frames": args.vlm_num_frames,
+        "llm_interval_steps": args.llm_interval_steps,
         "dashscope_base_url": args.dashscope_base_url,
         "enable_thinking": bool(args.enable_thinking),
+        "token_fallback": args.token_fallback,
+        "tokenizer_model": token_counter.tokenizer_model,
+        "tokenizer_local_files_only": not args.tokenizer_allow_download,
+        "token_counter_status": token_counter.status(),
+        "token_accounting_note": "Primary token metrics use DashScope/OpenAI-compatible response usage. Fallback counts are estimates and flagged per row.",
+        "scenario_design": [
+            {
+                "scenario_id": s.scenario_id,
+                "accident_type": s.accident_type,
+                "challenge": s.challenge,
+                "llm_advantage": s.llm_advantage,
+                "expected_review": s.expected_review,
+                "ambiguous": s.ambiguous,
+                "unseen_combo": s.unseen_combo,
+                "notes": s.notes,
+            }
+            for s in scenarios
+        ],
         "wall_time_sec": round(float(time.perf_counter() - t0), 3),
         "note": "DASHSCOPE_API_KEY is read from environment and is never saved in outputs.",
     }
@@ -1532,10 +1916,8 @@ def main() -> None:
         "run_config": run_config,
         "layer1_detection_summary": layer1_summary,
         "layer2_diagnosis_summary": layer2_summary,
-        "layer3_action_summary": layer3_summary,
         "layer1_rows": layer1_rows,
         "layer2_rows": layer2_rows,
-        "layer3_rows": layer3_rows,
     }
     with open(os.path.join(args.out_dir, "comprehensive_comparison_results.json"), "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -1545,31 +1927,25 @@ def main() -> None:
     save_csv(os.path.join(args.out_dir, "layer1_detection_summary.csv"), layer1_summary)
     save_csv(os.path.join(args.out_dir, "layer2_diagnosis_records.csv"), layer2_rows)
     save_csv(os.path.join(args.out_dir, "layer2_diagnosis_summary.csv"), layer2_summary)
-    save_csv(os.path.join(args.out_dir, "layer3_action_records.csv"), layer3_rows)
-    save_csv(os.path.join(args.out_dir, "layer3_action_summary.csv"), layer3_summary)
 
     print(f"\n===== Comprehensive F2E/LLM/VLM Comparison {COMPARISON_VERSION} =====")
     print(f"core={CORE_VERSION} profile={args.profile} layers={layers} seeds={seeds} steps={steps} scenarios={len(scenarios)}")
-    print(f"api_mode={args.api_mode} api_key_present={bool(api_key)} llm_model={args.llm_model} vlm_model={args.vlm_model} vlm_frame_mode={args.vlm_frame_mode} vlm_num_frames={args.vlm_num_frames} thinking={args.enable_thinking}")
+    print(f"api_mode={args.api_mode} api_key_present={bool(api_key)} llm_model={args.llm_model} vlm_model={args.vlm_model} vlm_frame_mode={args.vlm_frame_mode} vlm_num_frames={args.vlm_num_frames} llm_interval_steps={args.llm_interval_steps} thinking={args.enable_thinking}")
+    print(f"token_accounting=api_usage_primary fallback={args.token_fallback} tokenizer={token_counter.tokenizer_model}")
     print("NO-LEAK CHECK: the F2E encoder is called only via update(t, current_fields); GT masks and accident labels remain in the evaluator.")
     if layer1_summary:
         print("\nLayer 1 summary:")
         for r in layer1_summary:
-            print(f"  {r['detector']}: F1={r.get('detection_f1')} IoU={r.get('mean_iou')} centroid={r.get('centroid_error')} FP100={r.get('normal_fp_per_100_frames')} latency={r.get('latency_ms_per_frame')}ms/frame")
+            print(f"  {r['detector']}: F1={r.get('detection_f1')} IoU={r.get('mean_iou')} centroid={r.get('centroid_error')} FP100={r.get('normal_fp_per_100_frames')} latency={metric_ms(r.get('latency_ms_per_frame'))}/frame detector={metric_ms(r.get('detector_latency_ms_per_frame'))}/frame")
     if layer2_summary:
         print("\nLayer 2 summary:")
         for r in layer2_summary:
-            print(f"  {r['method']}: acc={r.get('accident_classification_accuracy')} macroF1={r.get('macro_f1')} ambiguous={r.get('ambiguous_case_accuracy')} unseen={r.get('unseen_combination_accuracy')} tokens={r.get('mean_total_tokens')} latency={r.get('mean_api_latency_ms')}ms")
-    if layer3_summary:
-        print("\nLayer 3 summary:")
-        for r in layer3_summary:
-            print(f"  {r['method']}: actP={r.get('actionable_precision')} actR={r.get('actionable_recall')} reviewP={r.get('review_precision')} resample={r.get('resampling_success_rate')} tokens={r.get('mean_total_tokens')}")
+            print(f"  {r['method']}: acc={r.get('accident_classification_accuracy')} macroF1={r.get('macro_f1')} ambiguous={r.get('ambiguous_case_accuracy')} unseen={r.get('unseen_combination_accuracy')} tokens={r.get('mean_total_tokens')} api_tokens={r.get('mean_total_tokens_api_only')} api_usage={r.get('api_usage_rate')} e2e={metric_ms(r.get('mean_end_to_end_latency_ms'))} api_uncached={metric_ms(r.get('mean_measured_api_latency_ms'))}")
     print("\nSaved:")
     for name in [
         "comprehensive_comparison_results.json", "run_config.json",
         "layer1_detection_records.csv", "layer1_detection_summary.csv",
         "layer2_diagnosis_records.csv", "layer2_diagnosis_summary.csv",
-        "layer3_action_records.csv", "layer3_action_summary.csv",
     ]:
         print("  " + os.path.join(args.out_dir, name))
 
