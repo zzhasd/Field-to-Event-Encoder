@@ -74,7 +74,7 @@ python field_event_visual_demos.py --demo fire --disable-llm
 
 ```bash
 export DASHSCOPE_API_KEY="你的 DashScope / Qwen API Key"
-python field_event_visual_demos.py --llm-eval --llm-eval-step 150 --llm-eval-out qwen_eval_results.json
+python field_event_visual_demos.py --llm-eval --llm-eval-step 150
 ```
 
 说明：当前评估采用场景名称关键字匹配，适合快速检查 demo 层大模型判读是否符合预期。论文实验可以把该脚本扩展为多 seed、多时间点、多模型对照。

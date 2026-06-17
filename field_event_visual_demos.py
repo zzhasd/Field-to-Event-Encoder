@@ -919,7 +919,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     parser.add_argument("--llm-eval", action="store_true", help="Headless: call Qwen once per demo and report scenario-level accuracy")
     parser.add_argument("--llm-eval-step", type=int, default=150)
-    parser.add_argument("--llm-eval-out", type=str, default=None)
+    parser.add_argument("--llm-eval-out", type=str, default="outputs/qwen_eval_results.json")
 
     args = parser.parse_args(argv)
 

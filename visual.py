@@ -103,7 +103,7 @@ ax.set_ylim(0, 1.0)
 plt.tight_layout()
 
 plt.savefig(
-    "encoder_performance_radar.png",
+    "outputs/encoder_performance_radar.png",
     dpi=300,
     bbox_inches="tight"
 )
