@@ -1,0 +1,1577 @@
+"""Comprehensive comparison experiments for Field-to-Event (F2E) + LLM systems.
+
+Version: v8.2.1
+
+This script is intentionally an experiment/evaluation layer only.  It imports the
+core no-leak F2E encoder from University_Field_to_Event_Encoder.py and never
+passes clean backgrounds, GT masks, injected labels, or accident labels into the
+encoder.
+
+Three-layer experimental design
+-------------------------------
+Layer 1: Low-level detection capability
+    Threshold connected components vs CUSUM/EWMA vs heatmap detector vs F2E.
+
+Layer 2: High-level accident diagnosis capability
+    threshold events + rules
+    threshold events + LLM
+    raw matrix summary + LLM
+    raw field image + VLM
+    F2E events + rules
+    F2E events + LLM
+
+Layer 3: Action decision capability
+    abnormal confirmation, review flagging, resampling target suggestion, and
+    low-confidence false-positive filtering.
+
+API safety
+----------
+The script reads DASHSCOPE_API_KEY from the environment.  It never stores or
+prints the key.  API calls are optional: --api-mode offline/auto/api.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import csv
+import hashlib
+import io
+import json
+import math
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+from scipy.ndimage import binary_dilation, gaussian_filter, label
+
+from University_Field_to_Event_Encoder import (
+    CORE_VERSION,
+    DEFAULT_OBS_RATIO,
+    FIELD_REGISTRY,
+    FIELDS,
+    GRID_SIZE,
+    EffectSpec,
+    StressConfig,
+    TestCase,
+    UniversalFieldToEventEncoder,
+    build_current_fields,
+    make_obstacle_grid,
+    nearest_free,
+)
+
+COMPARISON_VERSION = "v8.2.1"
+
+ACCIDENT_TYPES = [
+    "fire",
+    "electrical_overheat",
+    "water_leak",
+    "steam_leak",
+    "co2_accumulation",
+    "dust_pollution",
+    "composite_anomaly",
+    "low_snr_anomaly",
+    "needs_review_unknown",
+    "normal",
+]
+
+# ============================================================
+# Basic utilities
+# ============================================================
+def fmt_duration(seconds: float) -> str:
+    if not np.isfinite(seconds) or seconds < 0:
+        return "--:--:--"
+    seconds = int(round(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+class ProgressMeter:
+    def __init__(self, total: int, enabled: bool = True, width: int = 32, interval_sec: float = 2.0) -> None:
+        self.total = max(1, int(total))
+        self.enabled = enabled
+        self.width = max(8, int(width))
+        self.interval_sec = max(0.1, float(interval_sec))
+        self.start = time.perf_counter()
+        self.last_print = 0.0
+        self.is_tty = bool(getattr(sys.stderr, "isatty", lambda: False)())
+
+    def update(self, done: int, status: str = "") -> None:
+        if not self.enabled:
+            return
+        done = max(0, min(int(done), self.total))
+        now = time.perf_counter()
+        if done not in {0, 1, self.total} and (now - self.last_print) < self.interval_sec:
+            return
+        self.last_print = now
+        frac = done / self.total
+        filled = int(round(self.width * frac))
+        bar = "#" * filled + "-" * (self.width - filled)
+        elapsed = now - self.start
+        rate = done / elapsed if elapsed > 1e-9 else 0.0
+        eta = (self.total - done) / rate if rate > 1e-9 else float("nan")
+        line = f"[{bar}] {done}/{self.total} ({100*frac:6.2f}%) elapsed={fmt_duration(elapsed)} ETA={fmt_duration(eta)} rate={rate:.2f} jobs/s"
+        if status:
+            line += " | " + (status[:72] + "..." if len(status) > 75 else status)
+        if self.is_tty:
+            sys.stderr.write("\r" + line)
+            if done >= self.total:
+                sys.stderr.write("\n")
+            sys.stderr.flush()
+        else:
+            print(line, file=sys.stderr, flush=True)
+
+def save_csv(path: str, rows: List[Dict[str, Any]]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if not rows:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("")
+        return
+    keys = sorted({k for r in rows for k in r.keys()})
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        w.writerows(rows)
+
+def safe_mean(values: Iterable[Any]) -> Optional[float]:
+    xs = []
+    for v in values:
+        if v is None:
+            continue
+        try:
+            fv = float(v)
+        except Exception:
+            continue
+        if np.isfinite(fv):
+            xs.append(fv)
+    return float(np.mean(xs)) if xs else None
+
+def iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+    inter = int((mask_a & mask_b).sum())
+    union = int((mask_a | mask_b).sum())
+    return inter / union if union else 0.0
+
+def centroid_error(c0: Tuple[float, float], c1: Tuple[float, float]) -> float:
+    return float(np.linalg.norm(np.array(c0, dtype=float) - np.array(c1, dtype=float)))
+
+def precision_recall_f1(tp: int, fp: int, fn: int) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    p = tp / (tp + fp) if (tp + fp) > 0 else None
+    r = tp / (tp + fn) if (tp + fn) > 0 else None
+    f1 = None if p is None or r is None or (p + r) == 0 else 2 * p * r / (p + r)
+    return p, r, f1
+
+def macro_f1(y_true: Sequence[str], y_pred: Sequence[str], labels: Sequence[str]) -> Optional[float]:
+    scores = []
+    for lab in labels:
+        tp = sum(1 for a, b in zip(y_true, y_pred) if a == lab and b == lab)
+        fp = sum(1 for a, b in zip(y_true, y_pred) if a != lab and b == lab)
+        fn = sum(1 for a, b in zip(y_true, y_pred) if a == lab and b != lab)
+        _, _, f1 = precision_recall_f1(tp, fp, fn)
+        if f1 is not None:
+            scores.append(f1)
+    return float(np.mean(scores)) if scores else None
+
+# ============================================================
+# Scenario ontology
+# ============================================================
+def shape_radius(shape: str) -> float:
+    return {"point_like": 1.2, "compact_blob": 2.0, "blob": 3.4, "oval": 2.3, "elongated_strip": 2.3}[shape]
+
+@dataclass
+class AccidentScenario:
+    scenario_id: str
+    accident_type: str
+    testcase: TestCase
+    stress: StressConfig = field(default_factory=StressConfig)
+    ambiguous: bool = False
+    unseen_combo: bool = False
+    expected_review: bool = False
+    explanation_fields: Tuple[str, ...] = ()
+    target_field: Optional[str] = None
+    notes: str = ""
+
+def effect(eid: str, field_key: str, polarity: str, shape: str, center: Tuple[float, float],
+           area: str = "stable", intensity: str = "stable", amp: float = 3.5,
+           start: int = 25, end: int = 150, angle: float = 0.3) -> EffectSpec:
+    return EffectSpec(
+        effect_id=eid,
+        field_key=field_key,
+        polarity=polarity,
+        shape=shape,
+        area_trend=area,
+        intensity_trend=intensity,
+        center=center,
+        start=start,
+        end=end,
+        amplitude_sigma=amp,
+        radius=shape_radius(shape),
+        angle=angle,
+        axis_ratio=2.4,
+    )
+
+def make_accident_scenarios(profile: str = "paper") -> List[AccidentScenario]:
+    scenarios = [
+        AccidentScenario(
+            "fire_vs_overheat__fire", "fire",
+            TestCase("fire_vs_overheat__fire", [
+                effect("T_fire", "temperature", "high", "blob", (13, 14), "expanding", "strengthening", 4.0),
+                effect("AQI_fire", "air_quality", "high", "blob", (14, 15), "expanding", "strengthening", 3.2),
+                effect("CO2_fire", "co2", "high", "compact_blob", (15, 15), "expanding", "strengthening", 2.6),
+                effect("H_fire", "humidity", "low", "compact_blob", (14, 14), "stable", "weakening", 2.2),
+            ]),
+            explanation_fields=("temperature", "air_quality", "co2", "humidity"), target_field="temperature",
+            notes="Fire and electrical overheating both contain high temperature; fire has AQI/CO2/humidity evidence.",
+        ),
+        AccidentScenario(
+            "fire_vs_overheat__electrical", "electrical_overheat",
+            TestCase("fire_vs_overheat__electrical", [
+                effect("T_elec", "temperature", "high", "compact_blob", (16, 15), "stable", "strengthening", 4.2),
+                effect("P_elec", "pressure", "high", "point_like", (16, 15), "stable", "stable", 1.6),
+            ]),
+            explanation_fields=("temperature",), target_field="temperature",
+        ),
+        AccidentScenario(
+            "water_vs_steam__water", "water_leak",
+            TestCase("water_vs_steam__water", [
+                effect("H_water", "humidity", "high", "elongated_strip", (15, 12), "expanding", "stable", 3.8, angle=1.0),
+                effect("P_water", "pressure", "low", "compact_blob", (16, 13), "stable", "stable", 2.2),
+            ]),
+            explanation_fields=("humidity", "pressure"), target_field="humidity",
+            notes="Water leak and steam leak share high humidity; steam also has temperature and pressure evidence.",
+        ),
+        AccidentScenario(
+            "water_vs_steam__steam", "steam_leak",
+            TestCase("water_vs_steam__steam", [
+                effect("H_steam", "humidity", "high", "elongated_strip", (15, 17), "expanding", "strengthening", 3.8, angle=0.7),
+                effect("T_steam", "temperature", "high", "oval", (14, 17), "expanding", "stable", 2.9),
+                effect("P_steam", "pressure", "high", "compact_blob", (15, 18), "stable", "strengthening", 2.1),
+            ]),
+            explanation_fields=("humidity", "temperature", "pressure"), target_field="humidity",
+        ),
+        AccidentScenario(
+            "co2_vs_dust__co2", "co2_accumulation",
+            TestCase("co2_vs_dust__co2", [
+                effect("CO2_acc", "co2", "high", "blob", (14, 14), "expanding", "strengthening", 3.5),
+                effect("AQI_co2", "air_quality", "high", "compact_blob", (14, 15), "stable", "stable", 1.5),
+            ]),
+            explanation_fields=("co2", "air_quality"), target_field="co2",
+            notes="CO2 accumulation and dust pollution can both affect air quality; CO2 field separates them.",
+        ),
+        AccidentScenario(
+            "co2_vs_dust__dust", "dust_pollution",
+            TestCase("co2_vs_dust__dust", [
+                effect("AQI_dust", "air_quality", "high", "elongated_strip", (16, 16), "expanding", "strengthening", 3.8, angle=2.1),
+            ]),
+            explanation_fields=("air_quality",), target_field="air_quality",
+        ),
+        AccidentScenario(
+            "composite_fire_and_leak", "composite_anomaly",
+            TestCase("composite_fire_and_leak", [
+                effect("T_comp", "temperature", "high", "blob", (11, 12), "expanding", "strengthening", 3.6),
+                effect("AQI_comp", "air_quality", "high", "blob", (12, 12), "expanding", "strengthening", 2.8),
+                effect("H_comp", "humidity", "high", "elongated_strip", (20, 19), "expanding", "stable", 3.2, angle=1.3),
+            ]),
+            ambiguous=True, unseen_combo=True, explanation_fields=("temperature", "air_quality", "humidity"), target_field="temperature",
+            notes="Composite anomaly: traditional single-rule systems often misclassify into one incident.",
+        ),
+        AccidentScenario(
+            "low_snr_multi_field", "low_snr_anomaly",
+            TestCase("low_snr_multi_field", [
+                effect("T_lowsnr", "temperature", "high", "compact_blob", (14, 18), "expanding", "strengthening", 2.1),
+                effect("CO2_lowsnr", "co2", "high", "compact_blob", (15, 18), "stable", "strengthening", 1.8),
+                effect("AQI_lowsnr", "air_quality", "high", "compact_blob", (14, 17), "stable", "strengthening", 1.7),
+            ]),
+            stress=StressConfig("low_snr_noise", noise_sigma=0.35, anomaly_scale=0.65),
+            ambiguous=True, expected_review=True, explanation_fields=("temperature", "co2", "air_quality"), target_field="temperature",
+            notes="Low SNR: a strong system should combine weak trends and may request review.",
+        ),
+        AccidentScenario(
+            "missing_low_confidence_region", "needs_review_unknown",
+            TestCase("missing_low_confidence_region", [
+                effect("H_missing", "humidity", "high", "compact_blob", (16, 13), "expanding", "stable", 2.5),
+                effect("T_missing", "temperature", "high", "compact_blob", (16, 13), "stable", "stable", 1.9),
+            ]),
+            stress=StressConfig("occlusion_40", occlusion_rate=0.40, anomaly_scale=0.75),
+            ambiguous=True, expected_review=True, explanation_fields=("humidity", "temperature"), target_field="humidity",
+            notes="Missing/low-confidence region should produce review rather than a brittle hard label.",
+        ),
+        AccidentScenario(
+            "unseen_pressure_aqi_combo", "needs_review_unknown",
+            TestCase("unseen_pressure_aqi_combo", [
+                effect("P_unseen", "pressure", "high", "oval", (14, 12), "expanding", "strengthening", 2.8),
+                effect("AQI_unseen", "air_quality", "high", "oval", (14, 12), "stable", "strengthening", 2.7),
+                effect("H_unseen", "humidity", "low", "compact_blob", (15, 12), "stable", "stable", 2.0),
+            ]),
+            ambiguous=True, unseen_combo=True, expected_review=True, explanation_fields=("pressure", "air_quality", "humidity"), target_field="pressure",
+            notes="Unseen combination tests generalization and calibrated review behavior.",
+        ),
+        AccidentScenario(
+            "normal_no_incident", "normal",
+            TestCase("normal_no_incident", []),
+            explanation_fields=(), target_field=None,
+        ),
+    ]
+    if profile == "quick":
+        # Smoke test only: do not use this subset for paper conclusions.
+        keep = {"fire_vs_overheat__fire", "water_vs_steam__steam", "low_snr_multi_field", "normal_no_incident"}
+        return [s for s in scenarios if s.scenario_id in keep]
+    if profile == "hard":
+        # Hard set designed to expose LLM-level advantages: ambiguous, composite,
+        # low-SNR, missing-confidence, and unseen combinations.
+        keep = {
+            "fire_vs_overheat__electrical",
+            "water_vs_steam__water",
+            "co2_vs_dust__co2",
+            "co2_vs_dust__dust",
+            "composite_fire_and_leak",
+            "low_snr_multi_field",
+            "missing_low_confidence_region",
+            "unseen_pressure_aqi_combo",
+            "normal_no_incident",
+        }
+        return [s for s in scenarios if s.scenario_id in keep]
+    return scenarios
+
+# ============================================================
+# Low-level detectors
+# ============================================================
+def estimate_spatial_bg(x: np.ndarray, free_mask: np.ndarray, sigma: float = 5.0) -> np.ndarray:
+    valid = free_mask & np.isfinite(x)
+    if valid.sum() == 0:
+        out = np.zeros_like(x, dtype=np.float32)
+        out[~free_mask] = np.nan
+        return out
+    med = float(np.nanmedian(x[valid]))
+    filled = np.where(valid, x, med).astype(np.float32)
+    weight = valid.astype(np.float32)
+    num = gaussian_filter(filled * weight, sigma=sigma, mode="nearest")
+    den = gaussian_filter(weight, sigma=sigma, mode="nearest") + 1e-6
+    bg = (num / den).astype(np.float32)
+    resid = x - bg
+    bg = bg + float(np.nanmedian(resid[valid]))
+    bg[~free_mask] = np.nan
+    return bg
+
+def classify_simple(mask: np.ndarray) -> str:
+    pts = np.argwhere(mask)
+    area = len(pts)
+    if area <= 5:
+        return "point_like"
+    rmin, cmin = pts.min(axis=0)
+    rmax, cmax = pts.max(axis=0)
+    h = int(rmax - rmin + 1)
+    w = int(cmax - cmin + 1)
+    ratio = max(h, w) / max(1.0, min(h, w))
+    if ratio >= 3.0:
+        return "elongated_strip"
+    if ratio >= 1.7:
+        return "oval"
+    if area <= 28:
+        return "compact_blob"
+    return "blob"
+
+def extract_components(field_key: str, polarity: str, score: np.ndarray, mask: np.ndarray, t: int, min_area: int = 3) -> List[Dict[str, Any]]:
+    lab, n = label(mask, structure=np.ones((3, 3), dtype=np.uint8))
+    rr, cc = np.indices(mask.shape)
+    out: List[Dict[str, Any]] = []
+    sem = FIELD_REGISTRY[field_key]
+    for idx in range(1, n + 1):
+        comp = lab == idx
+        area = int(comp.sum())
+        if area < min_area:
+            continue
+        weights = score[comp] + 1e-6
+        centroid = (float(np.average(rr[comp], weights=weights)), float(np.average(cc[comp], weights=weights)))
+        morph = classify_simple(comp)
+        out.append({
+            "track_id": None,
+            "t": int(t),
+            "field_key": field_key,
+            "polarity": polarity,
+            "mask": comp,
+            "centroid": (round(centroid[0], 3), round(centroid[1], 3)),
+            "area": area,
+            "morphology": morph,
+            "z_core_mean": round(float(np.nanmean(score[comp])), 3),
+            "score_sum": round(float(np.nansum(score[comp])), 3),
+            "priority": round(float(np.nansum(score[comp])), 3),
+            "physical_tag": {"label": sem.high_label if polarity == "high" else sem.low_label},
+            "temporal_summary": {"area_trend": "stable", "intensity_trend": "stable"},
+        })
+    return out
+
+class DetectorBase:
+    name = "base"
+    def update(self, t: int, current_fields: Dict[str, np.ndarray]) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+class ThresholdCCDetector(DetectorBase):
+    name = "threshold_cc"
+    def __init__(self, grid: np.ndarray, z_threshold: float = 1.65) -> None:
+        self.grid = grid.astype(np.uint8)
+        self.free_mask = self.grid == 0
+        self.z_threshold = z_threshold
+    def update(self, t: int, current_fields: Dict[str, np.ndarray]) -> List[Dict[str, Any]]:
+        events: List[Dict[str, Any]] = []
+        for k, x in current_fields.items():
+            x = np.asarray(x, dtype=np.float32)
+            bg = estimate_spatial_bg(x, self.free_mask)
+            z = (x - bg) / (FIELD_REGISTRY[k].sigma + 1e-6)
+            z[~self.free_mask] = np.nan
+            for pol in ("high", "low"):
+                score = np.maximum(z, 0.0) if pol == "high" else np.maximum(-z, 0.0)
+                score[~np.isfinite(score)] = 0.0
+                mask = self.free_mask & (score >= self.z_threshold)
+                events.extend(extract_components(k, pol, score, mask, t, FIELD_REGISTRY[k].min_area))
+        return sorted(events, key=lambda e: e["priority"], reverse=True)
+
+class CUSUMEWMADetector(DetectorBase):
+    name = "cusum_ewma"
+    def __init__(self, grid: np.ndarray, alpha: float = 0.92, cusum_alpha: float = 0.82, z_threshold: float = 1.4, cusum_threshold: float = 1.0) -> None:
+        self.grid = grid.astype(np.uint8)
+        self.free_mask = self.grid == 0
+        self.alpha = alpha
+        self.cusum_alpha = cusum_alpha
+        self.z_threshold = z_threshold
+        self.cusum_threshold = cusum_threshold
+        self.bg: Dict[str, np.ndarray] = {}
+        self.cusum: Dict[Tuple[str, str], np.ndarray] = {}
+    def update(self, t: int, current_fields: Dict[str, np.ndarray]) -> List[Dict[str, Any]]:
+        events: List[Dict[str, Any]] = []
+        for k, x in current_fields.items():
+            x = np.asarray(x, dtype=np.float32)
+            spatial_bg = estimate_spatial_bg(x, self.free_mask)
+            if k not in self.bg:
+                self.bg[k] = spatial_bg.copy()
+            bg = self.bg[k]
+            z = (x - bg) / (FIELD_REGISTRY[k].sigma + 1e-6)
+            z[~self.free_mask] = np.nan
+            event_union = np.zeros_like(self.free_mask, dtype=bool)
+            for pol in ("high", "low"):
+                score = np.maximum(z, 0.0) if pol == "high" else np.maximum(-z, 0.0)
+                score[~np.isfinite(score)] = 0.0
+                ck = (k, pol)
+                if ck not in self.cusum:
+                    self.cusum[ck] = np.zeros_like(score, dtype=np.float32)
+                c = self.cusum[ck]
+                c[:] = self.cusum_alpha * c + (1 - self.cusum_alpha) * score
+                mask = self.free_mask & (score >= self.z_threshold) & (c >= self.cusum_threshold)
+                event_union |= mask
+                events.extend(extract_components(k, pol, score, mask, t, FIELD_REGISTRY[k].min_area))
+            valid = self.free_mask & np.isfinite(x) & (~event_union)
+            bg = bg.copy()
+            bg[valid] = self.alpha * bg[valid] + (1 - self.alpha) * x[valid]
+            bg[~self.free_mask] = np.nan
+            self.bg[k] = bg.astype(np.float32)
+        return sorted(events, key=lambda e: e["priority"], reverse=True)
+
+class VisionHeatmapDetector(DetectorBase):
+    name = "vision_heatmap"
+    def __init__(self, grid: np.ndarray, heat_sigma: float = 1.1, threshold: float = 1.20) -> None:
+        self.grid = grid.astype(np.uint8)
+        self.free_mask = self.grid == 0
+        self.heat_sigma = heat_sigma
+        self.threshold = threshold
+    def update(self, t: int, current_fields: Dict[str, np.ndarray]) -> List[Dict[str, Any]]:
+        events: List[Dict[str, Any]] = []
+        for k, x in current_fields.items():
+            x = np.asarray(x, dtype=np.float32)
+            bg = estimate_spatial_bg(x, self.free_mask, sigma=4.5)
+            z = (x - bg) / (FIELD_REGISTRY[k].sigma + 1e-6)
+            z[~self.free_mask] = np.nan
+            for pol in ("high", "low"):
+                score = np.maximum(z, 0.0) if pol == "high" else np.maximum(-z, 0.0)
+                score[~np.isfinite(score)] = 0.0
+                heat = gaussian_filter(score, sigma=self.heat_sigma, mode="nearest")
+                core = self.free_mask & (heat >= self.threshold)
+                support = self.free_mask & (heat >= 0.55 * self.threshold)
+                lab, n = label(support, structure=np.ones((3, 3), dtype=np.uint8))
+                mask = np.zeros_like(core, dtype=bool)
+                for idx in range(1, n + 1):
+                    comp = lab == idx
+                    if (comp & core).any():
+                        mask |= comp
+                events.extend(extract_components(k, pol, score, mask, t, FIELD_REGISTRY[k].min_area))
+        return sorted(events, key=lambda e: e["priority"], reverse=True)
+
+class F2EDetector(DetectorBase):
+    name = "f2e_encoder"
+    def __init__(self, grid: np.ndarray) -> None:
+        self.encoder = UniversalFieldToEventEncoder(grid, FIELD_REGISTRY)
+    def update(self, t: int, current_fields: Dict[str, np.ndarray]) -> List[Dict[str, Any]]:
+        return self.encoder.update(t, current_fields)
+
+def detector_factory(name: str, grid: np.ndarray) -> DetectorBase:
+    if name == "threshold_cc":
+        return ThresholdCCDetector(grid)
+    if name == "cusum_ewma":
+        return CUSUMEWMADetector(grid)
+    if name == "vision_heatmap":
+        return VisionHeatmapDetector(grid)
+    if name == "f2e_encoder":
+        return F2EDetector(grid)
+    raise ValueError(name)
+
+# ============================================================
+# Case preparation and event collection
+# ============================================================
+def clone_scenario_for_grid(scenario: AccidentScenario, grid: np.ndarray) -> AccidentScenario:
+    effects = []
+    for eff0 in scenario.testcase.effects:
+        e = EffectSpec(**asdict(eff0))
+        e.center = tuple(map(float, nearest_free(grid, e.center)))
+        effects.append(e)
+    return AccidentScenario(
+        scenario_id=scenario.scenario_id,
+        accident_type=scenario.accident_type,
+        testcase=TestCase(scenario.testcase.case_id, effects),
+        stress=scenario.stress,
+        ambiguous=scenario.ambiguous,
+        unseen_combo=scenario.unseen_combo,
+        expected_review=scenario.expected_review,
+        explanation_fields=scenario.explanation_fields,
+        target_field=scenario.target_field,
+        notes=scenario.notes,
+    )
+
+def field_keys_for_scenario(s: AccidentScenario, all_fields: bool = True) -> Tuple[str, ...]:
+    if all_fields or not s.testcase.effects:
+        return tuple(FIELDS)
+    return tuple(sorted({e.field_key for e in s.testcase.effects}))
+
+def serializable_event(e: Dict[str, Any]) -> Dict[str, Any]:
+    out = {k: v for k, v in e.items() if k != "mask"}
+    if "centroid" in out and isinstance(out["centroid"], tuple):
+        out["centroid"] = list(out["centroid"])
+    return out
+
+def summarize_events(events: List[Dict[str, Any]], max_events: int = 12) -> List[Dict[str, Any]]:
+    out = []
+    for ev in sorted(events, key=lambda x: float(x.get("priority", x.get("score_sum", 0.0))), reverse=True)[:max_events]:
+        tmp = ev.get("temporal_summary") or {}
+        out.append({
+            "field_key": ev.get("field_key"),
+            "polarity": ev.get("polarity"),
+            "morphology": ev.get("morphology"),
+            "centroid": ev.get("centroid"),
+            "area": ev.get("area"),
+            "z_core_mean": ev.get("z_core_mean"),
+            "score_sum": ev.get("score_sum", ev.get("priority")),
+            "area_trend": tmp.get("area_trend"),
+            "intensity_trend": tmp.get("intensity_trend"),
+            "physical_tag": (ev.get("physical_tag") or {}).get("label"),
+        })
+    return out
+
+def current_field_summary(fields_by_t: List[Dict[str, np.ndarray]], free_mask: np.ndarray) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {}
+    if not fields_by_t:
+        return summary
+    keys = fields_by_t[-1].keys()
+    for k in keys:
+        sem = FIELD_REGISTRY[k]
+        stack = np.array([f[k] for f in fields_by_t if k in f], dtype=np.float32)
+        last = stack[-1]
+        valid = free_mask & np.isfinite(last)
+        vals = last[valid]
+        if vals.size == 0:
+            continue
+        first = stack[0]
+        valid_first = free_mask & np.isfinite(first)
+        delta_med = float(np.nanmedian(last[valid]) - np.nanmedian(first[valid_first])) if valid_first.any() else 0.0
+        bg = estimate_spatial_bg(last, free_mask)
+        z = (last - bg) / (sem.sigma + 1e-6)
+        zvals = z[valid]
+        summary[k] = {
+            "mean": round(float(np.nanmean(vals)), 4),
+            "min": round(float(np.nanmin(vals)), 4),
+            "max": round(float(np.nanmax(vals)), 4),
+            "std": round(float(np.nanstd(vals)), 4),
+            "median_delta_from_first": round(delta_med, 4),
+            "max_abs_spatial_z": round(float(np.nanmax(np.abs(zvals))), 4) if zvals.size else None,
+            "high_z_cells": int(np.nansum(z > 1.65)),
+            "low_z_cells": int(np.nansum(z < -1.65)),
+        }
+    return summary
+
+def render_fields_image(fields: Dict[str, np.ndarray], out_path: str, title: str = "fields") -> Optional[str]:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+    keys = list(fields.keys())
+    n = len(keys)
+    fig, axes = plt.subplots(1, n, figsize=(3.0 * n, 3.2))
+    if n == 1:
+        axes = [axes]
+    for ax, k in zip(axes, keys):
+        im = ax.imshow(fields[k], interpolation="nearest")
+        ax.set_title(k)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.suptitle(title)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.savefig(out_path, dpi=140)
+    plt.close(fig)
+    return out_path
+
+def image_to_data_url(path: str) -> str:
+    with open(path, "rb") as f:
+        data = base64.b64encode(f.read()).decode("ascii")
+    return "data:image/png;base64," + data
+
+def render_fields_contact_sheet(fields_by_t: List[Dict[str, np.ndarray]], out_path: str,
+                                title: str = "temporal_fields", mode: str = "sampled",
+                                num_frames: int = 8) -> Tuple[Optional[str], List[int]]:
+    """Render a temporal contact sheet for the raw_field_image+VLM baseline.
+
+    Rows are physical fields; columns are time points.  This is deliberately a
+    VLM baseline input, not an input to the F2E encoder.  It gives the VLM a fair
+    chance to observe appearance, expansion/shrinking, and trend over time.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None, []
+    if not fields_by_t:
+        return None, []
+    n_total = len(fields_by_t)
+    if mode == "last":
+        idxs = [n_total - 1]
+    elif mode == "all":
+        idxs = list(range(n_total))
+        # Avoid unreadable monster images if a user accidentally requests all
+        # frames for a long run.  The run_config still records the requested mode.
+        if len(idxs) > 32:
+            idxs = [int(round(x)) for x in np.linspace(0, n_total - 1, 32)]
+    else:
+        n = max(2, min(int(num_frames), n_total))
+        idxs = [int(round(x)) for x in np.linspace(0, n_total - 1, n)]
+    # Preserve order and remove duplicates caused by short episodes.
+    idxs = list(dict.fromkeys(idxs))
+    keys = list(fields_by_t[idxs[-1]].keys())
+    n_rows, n_cols = len(keys), len(idxs)
+    fig_w = max(3.2, 2.15 * n_cols)
+    fig_h = max(3.0, 2.05 * n_rows)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_w, fig_h), squeeze=False)
+    for r, k in enumerate(keys):
+        # Use a consistent color range per field across time so VLM sees trends.
+        vals = []
+        for idx in idxs:
+            arr = fields_by_t[idx].get(k)
+            if arr is not None:
+                vv = arr[np.isfinite(arr)]
+                if vv.size:
+                    vals.append(vv)
+        if vals:
+            vv = np.concatenate(vals)
+            vmin, vmax = np.nanpercentile(vv, [2, 98])
+            if not np.isfinite(vmin) or not np.isfinite(vmax) or abs(vmax - vmin) < 1e-9:
+                vmin, vmax = None, None
+        else:
+            vmin, vmax = None, None
+        for c, idx in enumerate(idxs):
+            ax = axes[r][c]
+            arr = fields_by_t[idx].get(k)
+            im = ax.imshow(arr, interpolation="nearest", vmin=vmin, vmax=vmax)
+            if r == 0:
+                ax.set_title(f"t={idx}")
+            if c == 0:
+                ax.set_ylabel(k)
+            ax.set_xticks([])
+            ax.set_yticks([])
+    fig.suptitle(title + f" | VLM contact sheet mode={mode}, frames={idxs}")
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.savefig(out_path, dpi=135)
+    plt.close(fig)
+    return out_path, idxs
+
+@dataclass
+class RunTrace:
+    scenario: AccidentScenario
+    seed: int
+    detector_name: str
+    events_last: List[Dict[str, Any]]
+    events_all: List[Dict[str, Any]]
+    fields_window: List[Dict[str, np.ndarray]]
+    fields_last: Dict[str, np.ndarray]
+    grid: np.ndarray
+    gt_last: List[Dict[str, Any]]
+    low_metrics: Dict[str, Any]
+    latency_ms: float
+
+def collect_run_trace(scenario: AccidentScenario, seed: int, steps: int, detector_name: str, obs_ratio: float, all_fields: bool = True) -> RunTrace:
+    grid = make_obstacle_grid(GRID_SIZE, obs_ratio, seed=seed)
+    sc = clone_scenario_for_grid(scenario, grid)
+    detector = detector_factory(detector_name, grid)
+    field_keys = field_keys_for_scenario(sc, all_fields=all_fields)
+    tp = fp_normal = fp_extra = fn = 0
+    normal_frames = effect_frames = 0
+    ious: List[float] = []
+    cerrors: List[float] = []
+    first_det: Optional[int] = None
+    events_last: List[Dict[str, Any]] = []
+    events_all: List[Dict[str, Any]] = []
+    fields_window: List[Dict[str, np.ndarray]] = []
+    fields_last: Dict[str, np.ndarray] = {}
+    gt_last: List[Dict[str, Any]] = []
+    t0 = time.perf_counter()
+    for t in range(steps):
+        rng = np.random.default_rng(seed * 1000003 + t)
+        current, gt_records = build_current_fields(grid, sc.testcase, t, field_keys, stress=sc.stress, rng=rng)
+        events = detector.update(t, current)
+        fields_last = current
+        gt_last = gt_records
+        # Keep the full episode history so the VLM baseline can receive a fair
+        # temporal contact sheet. This remains evaluator-side data; it is never
+        # passed into the F2E encoder.
+        fields_window.append({k: v.copy() for k, v in current.items()})
+        events_last = events
+        events_all.extend([serializable_event(ev) for ev in events[:10]])
+        matched = set()
+        for gt in gt_records:
+            candidates = [(idx, ev, iou(gt["mask"], ev["mask"])) for idx, ev in enumerate(events) if ev.get("field_key") == gt["field_key"] and ev.get("polarity") == gt["polarity"]]
+            if candidates:
+                idx, ev, best_iou = max(candidates, key=lambda x: x[2])
+            else:
+                idx, ev, best_iou = -1, None, 0.0
+            if ev is not None and best_iou >= 0.10:
+                tp += 1
+                matched.add(idx)
+                ious.append(float(best_iou))
+                cerrors.append(centroid_error(gt["centroid"], ev["centroid"]))
+                if first_det is None:
+                    first_det = t
+            else:
+                fn += 1
+        if t > 40:
+            if gt_records:
+                effect_frames += 1
+            else:
+                normal_frames += 1
+            for idx, _ev in enumerate(events):
+                if idx not in matched:
+                    if gt_records:
+                        fp_extra += 1
+                    else:
+                        fp_normal += 1
+    elapsed = (time.perf_counter() - t0) * 1000
+    _, _, f1 = precision_recall_f1(tp, fp_normal + fp_extra, fn)
+    low_metrics = {
+        "tp": tp,
+        "fp": fp_normal + fp_extra,
+        "normal_fp": fp_normal,
+        "extra_event_fp": fp_extra,
+        "fn": fn,
+        "detection_f1": round(float(f1), 6) if f1 is not None else None,
+        "mean_iou": round(float(np.mean(ious)), 6) if ious else None,
+        "centroid_error": round(float(np.mean(cerrors)), 6) if cerrors else None,
+        "normal_fp_per_100_frames": round(float(100 * fp_normal / max(1, normal_frames)), 6),
+        "extra_event_fp_per_100_effect_frames": round(float(100 * fp_extra / max(1, effect_frames)), 6),
+        "latency_steps": None if first_det is None or not sc.testcase.effects else int(first_det - min(e.start for e in sc.testcase.effects)),
+        "latency_ms_per_frame": round(float(elapsed / max(1, steps)), 6),
+    }
+    return RunTrace(sc, seed, detector_name, events_last, events_all, fields_window, fields_last, grid, gt_last, low_metrics, elapsed)
+
+# ============================================================
+# Rule-based diagnosis and decisions
+# ============================================================
+def event_presence(events: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
+    pres: Dict[str, Dict[str, float]] = {k: {"high": 0.0, "low": 0.0} for k in FIELDS}
+    for ev in events:
+        k, p = ev.get("field_key"), ev.get("polarity")
+        if k in pres and p in pres[k]:
+            pres[k][p] = max(pres[k][p], float(ev.get("z_core_mean", 0.0) or ev.get("priority", 0.0) or 0.0))
+    return pres
+
+def diagnose_by_rules(events: List[Dict[str, Any]], source_name: str = "events") -> Dict[str, Any]:
+    pres = event_presence(events)
+    high = lambda k: pres.get(k, {}).get("high", 0.0) > 0
+    low = lambda k: pres.get(k, {}).get("low", 0.0) > 0
+    n_fields = sum(1 for k in FIELDS if high(k) or low(k))
+    label = "normal"
+    conf = 0.55
+    review = False
+    reasons = []
+    if high("temperature") and (high("air_quality") or high("co2")):
+        if high("humidity"):
+            label = "composite_anomaly"
+            conf = 0.72
+            review = True
+            reasons.append("temperature/AQI or CO2 plus humidity suggests composite incident")
+        else:
+            label = "fire"
+            conf = 0.82
+            reasons.append("high temperature with air quality/CO2 evidence")
+    elif high("temperature") and high("humidity") and high("pressure"):
+        label = "steam_leak"
+        conf = 0.84
+        reasons.append("high humidity with temperature and pressure disturbance")
+    elif high("humidity") and not high("temperature"):
+        label = "water_leak"
+        conf = 0.78
+        reasons.append("humidity anomaly without thermal signature")
+    elif high("temperature"):
+        label = "electrical_overheat"
+        conf = 0.74
+        reasons.append("isolated high temperature")
+    elif high("co2") and not high("air_quality"):
+        label = "co2_accumulation"
+        conf = 0.78
+        reasons.append("CO2-specific anomaly")
+    elif high("co2") and high("air_quality"):
+        label = "co2_accumulation"
+        conf = 0.72
+        reasons.append("CO2 is present, stronger than generic air quality evidence")
+    elif high("air_quality"):
+        label = "dust_pollution"
+        conf = 0.74
+        reasons.append("air-quality anomaly without CO2 field evidence")
+    elif n_fields >= 2:
+        label = "needs_review_unknown"
+        conf = 0.50
+        review = True
+        reasons.append("multi-field pattern does not match known rule templates")
+    else:
+        label = "normal"
+        conf = 0.70
+        reasons.append("no consistent event pattern")
+    if len(events) == 0:
+        label, conf = "normal", 0.75
+    if any(float(ev.get("z_core_mean", 0.0) or 0.0) < 1.0 for ev in events) and len(events) <= 2:
+        review = True
+        conf = min(conf, 0.58)
+    target = None
+    if events:
+        target_ev = max(events, key=lambda e: float(e.get("priority", e.get("score_sum", 0.0)) or 0.0))
+        target = {"field_key": target_ev.get("field_key"), "centroid": target_ev.get("centroid")}
+    return {
+        "accident_type": label,
+        "confidence": round(float(conf), 3),
+        "review_needed": bool(review),
+        "abnormal_confirmed": bool(label != "normal" and conf >= 0.55 and not (review and conf < 0.60)),
+        "resample_target": target,
+        "explanation": f"Rule diagnosis from {source_name}: " + "; ".join(reasons),
+        "evidence_fields": [k for k in FIELDS if high(k) or low(k)],
+    }
+
+def action_from_diagnosis(diag: Dict[str, Any]) -> Dict[str, Any]:
+    label = diag.get("accident_type", "normal")
+    conf = float(diag.get("confidence", 0.0) or 0.0)
+    review = bool(diag.get("review_needed", False))
+    abnormal = label != "normal" and conf >= 0.55 and not (review and conf < 0.62)
+    return {
+        "confirm_abnormal": bool(abnormal),
+        "mark_review": bool(review or conf < 0.62 or label == "needs_review_unknown"),
+        "filter_as_low_confidence_fp": bool(label == "normal" or (conf < 0.55 and not review)),
+        "resample_target": diag.get("resample_target"),
+    }
+
+# ============================================================
+# DashScope OpenAI-compatible client
+# ============================================================
+@dataclass
+class ModelCallResult:
+    ok: bool
+    content: str
+    parsed: Optional[Dict[str, Any]]
+    latency_ms: float
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    model: Optional[str] = None
+    error: Optional[str] = None
+    from_cache: bool = False
+
+def usage_value(usage: Dict[str, Any], *names: str) -> Optional[int]:
+    for name in names:
+        val = usage.get(name)
+        if val is None:
+            continue
+        try:
+            return int(val)
+        except Exception:
+            continue
+    return None
+
+def usage_triplet(usage: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    prompt = usage_value(usage, "prompt_tokens", "input_tokens", "input_token_count")
+    completion = usage_value(usage, "completion_tokens", "output_tokens", "output_token_count")
+    total = usage_value(usage, "total_tokens", "total_token_count")
+    if total is None and (prompt is not None or completion is not None):
+        total = int(prompt or 0) + int(completion or 0)
+    return prompt, completion, total
+
+class DashScopeClient:
+    def __init__(self, api_key: Optional[str], base_url: str, cache_path: Optional[str] = None,
+                 enable_thinking: bool = False, timeout: float = 60.0) -> None:
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.enable_thinking = enable_thinking
+        self.timeout = timeout
+        self.cache_path = cache_path
+        self.cache: Dict[str, Dict[str, Any]] = {}
+        if cache_path and os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    self.cache = json.load(f)
+            except Exception:
+                self.cache = {}
+
+    def _cache_key(self, payload: Dict[str, Any]) -> str:
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
+
+    def _save_cache(self) -> None:
+        if not self.cache_path:
+            return
+        os.makedirs(os.path.dirname(self.cache_path), exist_ok=True)
+        tmp = self.cache_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.cache, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self.cache_path)
+
+    def call(self, model: str, messages: List[Dict[str, Any]], max_tokens: int = 512, temperature: float = 0.0) -> ModelCallResult:
+        if not self.api_key:
+            return ModelCallResult(False, "", None, 0.0, error="DASHSCOPE_API_KEY is not set")
+        payload: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if self.enable_thinking:
+            # DashScope exposes this as extra_body={"enable_thinking": True}
+            # through the OpenAI SDK; in raw HTTP it is sent as a top-level field.
+            payload["enable_thinking"] = True
+        key = self._cache_key(payload)
+        if key in self.cache:
+            c = self.cache[key]
+            return ModelCallResult(True, c.get("content", ""), c.get("parsed"), 0.0,
+                                   c.get("prompt_tokens"), c.get("completion_tokens"), c.get("total_tokens"),
+                                   c.get("model", model), from_cache=True)
+        req = urllib.request.Request(
+            self.base_url + "/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        t0 = time.perf_counter()
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                body = resp.read().decode("utf-8")
+            latency = (time.perf_counter() - t0) * 1000
+            data = json.loads(body)
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            usage = data.get("usage", {}) or {}
+            parsed = parse_json_object(content)
+            prompt_tokens, completion_tokens, total_tokens = usage_triplet(usage)
+            cache_val = {
+                "content": content,
+                "parsed": parsed,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+                "model": data.get("model", model),
+            }
+            self.cache[key] = cache_val
+            self._save_cache()
+            return ModelCallResult(True, content, parsed, latency,
+                                   prompt_tokens, completion_tokens, total_tokens,
+                                   data.get("model", model))
+        except urllib.error.HTTPError as e:
+            err = e.read().decode("utf-8", errors="replace")[:1000]
+            return ModelCallResult(False, "", None, (time.perf_counter() - t0) * 1000, error=f"HTTP {e.code}: {err}")
+        except Exception as e:
+            return ModelCallResult(False, "", None, (time.perf_counter() - t0) * 1000, error=repr(e))
+
+def parse_json_object(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    s = text.strip()
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", s, flags=re.S)
+    if not m:
+        return None
+    try:
+        obj = json.loads(m.group(0))
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+def offline_llm_proxy(payload: Dict[str, Any], mode: str) -> Dict[str, Any]:
+    # Deterministic proxy for dry-run pipeline validation. It deliberately uses
+    # only the same public input representation that would be sent to the model.
+    events = payload.get("events") or []
+    field_summary = payload.get("field_summary") or {}
+    guessed = diagnose_by_rules(events, source_name=f"offline_{mode}") if events else diagnose_from_matrix_summary(field_summary)
+    guessed["explanation"] = f"Offline proxy ({mode}); replace with --api-mode api for real LLM/VLM measurement. " + guessed.get("explanation", "")
+    return guessed
+
+def diagnose_from_matrix_summary(field_summary: Dict[str, Any]) -> Dict[str, Any]:
+    events = []
+    for k, s in field_summary.items():
+        if s.get("high_z_cells", 0) > 2:
+            events.append({"field_key": k, "polarity": "high", "z_core_mean": s.get("max_abs_spatial_z", 0), "priority": s.get("max_abs_spatial_z", 0), "centroid": None})
+        if s.get("low_z_cells", 0) > 2:
+            events.append({"field_key": k, "polarity": "low", "z_core_mean": s.get("max_abs_spatial_z", 0), "priority": s.get("max_abs_spatial_z", 0), "centroid": None})
+    return diagnose_by_rules(events, source_name="raw_matrix_summary")
+
+def build_diagnosis_prompt(input_kind: str, scenario_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    allowed = ", ".join(ACCIDENT_TYPES)
+    system = (
+        "You are an industrial multi-physics accident diagnosis module. "
+        "Return only one JSON object. Do not include markdown. "
+        f"Allowed accident_type labels: {allowed}. "
+        "The JSON schema is: {\"accident_type\": str, \"confidence\": float, "
+        "\"review_needed\": bool, \"abnormal_confirmed\": bool, "
+        "\"resample_target\": {\"field_key\": str|null, \"centroid\": [row,col]|null}|null, "
+        "\"evidence_fields\": [str], \"explanation\": str}. "
+        "Prefer needs_review_unknown over a brittle hard label if evidence is missing, low-confidence, or an unseen combination."
+    )
+    user = {
+        "input_kind": input_kind,
+        "task": "Diagnose the accident type and propose review/resampling action from the provided no-leak observation representation.",
+        "payload": scenario_payload,
+    }
+    return [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(user, ensure_ascii=False)}]
+
+def build_vlm_messages(image_data_url: str, scenario_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    allowed = ", ".join(ACCIDENT_TYPES)
+    text = (
+        "You are diagnosing industrial multi-physics field images. "
+        f"Allowed accident_type labels: {allowed}. "
+        "Use the image plus the metadata below. Return only JSON with keys: "
+        "accident_type, confidence, review_needed, abnormal_confirmed, resample_target, evidence_fields, explanation.\n"
+        + json.dumps(scenario_payload, ensure_ascii=False)
+    )
+    return [
+        {"role": "system", "content": "Return only a valid JSON object. Do not include markdown."},
+        {"role": "user", "content": [
+            {"type": "text", "text": text},
+            {"type": "image_url", "image_url": {"url": image_data_url}},
+        ]},
+    ]
+
+# ============================================================
+# Layer 1 metrics
+# ============================================================
+def run_layer1(scenarios: List[AccidentScenario], seeds: int, steps: int, obs_ratio: float, base_seed: int,
+               detector_names: List[str], progress: ProgressMeter, start_job: int) -> Tuple[List[Dict[str, Any]], int]:
+    rows: List[Dict[str, Any]] = []
+    job = start_job
+    for epi in range(seeds):
+        for sc_idx, sc in enumerate(scenarios):
+            for det in detector_names:
+                seed = base_seed + 100000 * epi + 1000 * sc_idx
+                trace = collect_run_trace(sc, seed, steps, det, obs_ratio, all_fields=True)
+                row = {
+                    "layer": "low_level_detection",
+                    "seed_index": epi,
+                    "seed": seed,
+                    "scenario_id": sc.scenario_id,
+                    "accident_type": sc.accident_type,
+                    "detector": det,
+                    "ambiguous": sc.ambiguous,
+                    "unseen_combo": sc.unseen_combo,
+                    **trace.low_metrics,
+                }
+                rows.append(row)
+                job += 1
+                progress.update(job, f"L1 seed={epi+1}/{seeds} scenario={sc.scenario_id} detector={det}")
+    return rows, job
+
+def aggregate_layer1(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        groups.setdefault(r["detector"], []).append(r)
+    out = []
+    for det, rs in sorted(groups.items()):
+        tp = int(sum(r.get("tp", 0) for r in rs))
+        fp = int(sum(r.get("fp", 0) for r in rs))
+        fn = int(sum(r.get("fn", 0) for r in rs))
+        p, rec, f1 = precision_recall_f1(tp, fp, fn)
+        out.append({
+            "detector": det,
+            "n": len(rs),
+            "detection_precision": round(float(p), 6) if p is not None else None,
+            "detection_recall": round(float(rec), 6) if rec is not None else None,
+            "detection_f1": round(float(f1), 6) if f1 is not None else None,
+            "mean_iou": round(float(safe_mean([r.get("mean_iou") for r in rs])), 6) if safe_mean([r.get("mean_iou") for r in rs]) is not None else None,
+            "centroid_error": round(float(safe_mean([r.get("centroid_error") for r in rs])), 6) if safe_mean([r.get("centroid_error") for r in rs]) is not None else None,
+            "normal_fp_per_100_frames": round(float(safe_mean([r.get("normal_fp_per_100_frames") for r in rs])), 6) if safe_mean([r.get("normal_fp_per_100_frames") for r in rs]) is not None else None,
+            "extra_event_fp_per_100_effect_frames": round(float(safe_mean([r.get("extra_event_fp_per_100_effect_frames") for r in rs])), 6) if safe_mean([r.get("extra_event_fp_per_100_effect_frames") for r in rs]) is not None else None,
+            "latency_steps": round(float(safe_mean([r.get("latency_steps") for r in rs])), 6) if safe_mean([r.get("latency_steps") for r in rs]) is not None else None,
+            "latency_ms_per_frame": round(float(safe_mean([r.get("latency_ms_per_frame") for r in rs])), 6) if safe_mean([r.get("latency_ms_per_frame") for r in rs]) is not None else None,
+        })
+    return out
+
+# ============================================================
+# Layers 2 and 3
+# ============================================================
+def normalize_diag(diag: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(diag, dict):
+        return {"accident_type": "needs_review_unknown", "confidence": 0.0, "review_needed": True, "abnormal_confirmed": False, "resample_target": None, "evidence_fields": [], "explanation": "invalid or missing model output"}
+    label = str(diag.get("accident_type", "needs_review_unknown"))
+    if label not in ACCIDENT_TYPES:
+        label = "needs_review_unknown"
+    try:
+        conf = float(diag.get("confidence", 0.0))
+    except Exception:
+        conf = 0.0
+    return {
+        "accident_type": label,
+        "confidence": max(0.0, min(1.0, conf)),
+        "review_needed": bool(diag.get("review_needed", label == "needs_review_unknown")),
+        "abnormal_confirmed": bool(diag.get("abnormal_confirmed", label not in {"normal", "needs_review_unknown"} and conf >= 0.55)),
+        "resample_target": diag.get("resample_target"),
+        "evidence_fields": diag.get("evidence_fields", []) if isinstance(diag.get("evidence_fields", []), list) else [],
+        "explanation": str(diag.get("explanation", "")),
+    }
+
+def explanation_score(diag: Dict[str, Any], scenario: AccidentScenario) -> float:
+    req = list(scenario.explanation_fields)
+    if not req:
+        return 1.0 if diag.get("accident_type") == "normal" else 0.0
+    text = (diag.get("explanation", "") + " " + " ".join(map(str, diag.get("evidence_fields", [])))).lower()
+    hits = sum(1 for f in req if f.lower() in text)
+    return hits / max(1, len(req))
+
+def resample_success(diag: Dict[str, Any], scenario: AccidentScenario, gt_last: List[Dict[str, Any]]) -> Optional[float]:
+    target = diag.get("resample_target")
+    if not scenario.testcase.effects:
+        return None
+    if target is None:
+        return 0.0
+    centroid = target.get("centroid") if isinstance(target, dict) else None
+    field_key = target.get("field_key") if isinstance(target, dict) else None
+    if centroid is None or not isinstance(centroid, (list, tuple)) or len(centroid) != 2:
+        return 0.0
+    try:
+        c = (float(centroid[0]), float(centroid[1]))
+    except Exception:
+        return 0.0
+    candidates = [g for g in gt_last if field_key is None or g.get("field_key") == field_key]
+    if not candidates:
+        candidates = gt_last
+    if not candidates:
+        return 0.0
+    best = min(centroid_error(c, g["centroid"]) for g in candidates)
+    return 1.0 if best <= 5.0 else 0.0
+
+def token_estimate_from_payload(payload: Any) -> int:
+    # Coarse, reproducible proxy when API usage is unavailable.
+    return max(1, int(len(json.dumps(payload, ensure_ascii=False)) / 4))
+
+def call_or_offline(client: DashScopeClient, api_mode: str, model: str, messages: List[Dict[str, Any]],
+                    offline_payload: Dict[str, Any], mode: str, max_tokens: int = 512) -> ModelCallResult:
+    use_api = api_mode == "api" or (api_mode == "auto" and bool(client.api_key))
+    if not use_api:
+        parsed = offline_llm_proxy(offline_payload, mode)
+        return ModelCallResult(True, json.dumps(parsed, ensure_ascii=False), parsed, 0.0,
+                               prompt_tokens=token_estimate_from_payload(messages), completion_tokens=token_estimate_from_payload(parsed),
+                               total_tokens=token_estimate_from_payload(messages) + token_estimate_from_payload(parsed), model="offline_proxy")
+    res = client.call(model, messages, max_tokens=max_tokens, temperature=0.0)
+    if res.ok and res.parsed:
+        # Some DashScope-compatible responses omit OpenAI-style usage fields or
+        # use model-specific names.  Keep the raw parsed result, but fill a
+        # reproducible proxy so token/cost columns are never empty.
+        if res.prompt_tokens is None:
+            res.prompt_tokens = token_estimate_from_payload(messages)
+        if res.completion_tokens is None:
+            res.completion_tokens = token_estimate_from_payload(res.parsed)
+        if res.total_tokens is None:
+            res.total_tokens = int(res.prompt_tokens or 0) + int(res.completion_tokens or 0)
+        return res
+    # Preserve the API error while making the pipeline complete.
+    parsed = offline_llm_proxy(offline_payload, mode)
+    parsed["explanation"] = "API call failed; offline fallback used for pipeline continuity. " + parsed.get("explanation", "")
+    prompt_tokens = res.prompt_tokens if res.prompt_tokens is not None else token_estimate_from_payload(messages)
+    completion_tokens = res.completion_tokens if res.completion_tokens is not None else token_estimate_from_payload(parsed)
+    total_tokens = res.total_tokens if res.total_tokens is not None else int(prompt_tokens or 0) + int(completion_tokens or 0)
+    return ModelCallResult(False, json.dumps(parsed, ensure_ascii=False), parsed, res.latency_ms,
+                           prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, total_tokens=total_tokens,
+                           model=res.model or model, error=res.error)
+
+def build_method_inputs(trace_threshold: RunTrace, trace_f2e: RunTrace, image_dir: str,
+                        vlm_frame_mode: str = "sampled", vlm_num_frames: int = 8) -> Dict[str, Dict[str, Any]]:
+    th_events = summarize_events(trace_threshold.events_last)
+    f2e_events = summarize_events(trace_f2e.events_last)
+    matrix_summary = current_field_summary(trace_f2e.fields_window, trace_f2e.grid == 0)
+    img_path: Optional[str]
+    frame_indices: List[int]
+    if vlm_frame_mode == "last":
+        img_path = render_fields_image(
+            trace_f2e.fields_last,
+            os.path.join(image_dir, f"{trace_f2e.scenario.scenario_id}_seed{trace_f2e.seed}_last.png"),
+            trace_f2e.scenario.scenario_id,
+        )
+        frame_indices = [len(trace_f2e.fields_window) - 1]
+    else:
+        img_path, frame_indices = render_fields_contact_sheet(
+            trace_f2e.fields_window,
+            os.path.join(image_dir, f"{trace_f2e.scenario.scenario_id}_seed{trace_f2e.seed}_{vlm_frame_mode}{vlm_num_frames}.png"),
+            trace_f2e.scenario.scenario_id,
+            mode=vlm_frame_mode,
+            num_frames=vlm_num_frames,
+        )
+    return {
+        "threshold_events": {"events": th_events},
+        "f2e_events": {"events": f2e_events},
+        "raw_matrix_summary": {"field_summary": matrix_summary},
+        "raw_field_image": {
+            "field_summary": matrix_summary,
+            "image_path": img_path,
+            "vlm_frame_mode": vlm_frame_mode,
+            "vlm_frame_indices": frame_indices,
+        },
+    }
+
+def run_layers23(scenarios: List[AccidentScenario], seeds: int, steps: int, obs_ratio: float, base_seed: int,
+                 out_dir: str, api_mode: str, client: DashScopeClient, llm_model: str, vlm_model: str,
+                 progress: ProgressMeter, start_job: int, vlm_frame_mode: str = "sampled",
+                 vlm_num_frames: int = 8) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
+    diag_rows: List[Dict[str, Any]] = []
+    action_rows: List[Dict[str, Any]] = []
+    job = start_job
+    methods = [
+        "threshold_events_rules",
+        "threshold_events_llm",
+        "raw_matrix_summary_llm",
+        "raw_field_image_vlm",
+        "f2e_events_rules",
+        "f2e_events_llm",
+    ]
+    image_dir = os.path.join(out_dir, "field_images")
+    for epi in range(seeds):
+        for sc_idx, sc in enumerate(scenarios):
+            seed = base_seed + 2000000 + 100000 * epi + 1000 * sc_idx
+            trace_threshold = collect_run_trace(sc, seed, steps, "threshold_cc", obs_ratio, all_fields=True)
+            trace_f2e = collect_run_trace(sc, seed, steps, "f2e_encoder", obs_ratio, all_fields=True)
+            method_inputs = build_method_inputs(trace_threshold, trace_f2e, image_dir, vlm_frame_mode, vlm_num_frames)
+            for method in methods:
+                call_res = ModelCallResult(True, "", {}, 0.0, 0, 0, 0, model="rules")
+                if method == "threshold_events_rules":
+                    diag = diagnose_by_rules(method_inputs["threshold_events"]["events"], source_name="threshold_events")
+                elif method == "f2e_events_rules":
+                    diag = diagnose_by_rules(method_inputs["f2e_events"]["events"], source_name="f2e_events")
+                elif method == "threshold_events_llm":
+                    payload = {"events": method_inputs["threshold_events"]["events"], "observation_representation": "threshold_connected_component_events"}
+                    messages = build_diagnosis_prompt("threshold_events", payload)
+                    call_res = call_or_offline(client, api_mode, llm_model, messages, payload, "threshold_events_llm")
+                    diag = normalize_diag(call_res.parsed)
+                elif method == "f2e_events_llm":
+                    payload = {"events": method_inputs["f2e_events"]["events"], "observation_representation": "F2E_structured_event_tokens"}
+                    messages = build_diagnosis_prompt("f2e_events", payload)
+                    call_res = call_or_offline(client, api_mode, llm_model, messages, payload, "f2e_events_llm")
+                    diag = normalize_diag(call_res.parsed)
+                elif method == "raw_matrix_summary_llm":
+                    payload = {"field_summary": method_inputs["raw_matrix_summary"]["field_summary"], "observation_representation": "raw_matrix_statistical_summary"}
+                    messages = build_diagnosis_prompt("raw_matrix_summary", payload)
+                    call_res = call_or_offline(client, api_mode, llm_model, messages, payload, "raw_matrix_summary_llm")
+                    diag = normalize_diag(call_res.parsed)
+                elif method == "raw_field_image_vlm":
+                    img_path = method_inputs["raw_field_image"].get("image_path")
+                    payload = {
+                        "field_summary": method_inputs["raw_field_image"]["field_summary"],
+                        "observation_representation": "raw_field_image_temporal_contact_sheet",
+                        "vlm_frame_mode": method_inputs["raw_field_image"].get("vlm_frame_mode"),
+                        "vlm_frame_indices": method_inputs["raw_field_image"].get("vlm_frame_indices"),
+                    }
+                    if img_path and os.path.exists(img_path):
+                        messages = build_vlm_messages(image_to_data_url(img_path), payload)
+                        call_res = call_or_offline(client, api_mode, vlm_model, messages, payload, "raw_field_image_vlm", max_tokens=512)
+                        diag = normalize_diag(call_res.parsed)
+                    else:
+                        parsed = offline_llm_proxy(payload, "raw_field_image_vlm_no_matplotlib")
+                        call_res = ModelCallResult(True, json.dumps(parsed), parsed, 0.0, prompt_tokens=token_estimate_from_payload(payload), completion_tokens=token_estimate_from_payload(parsed), total_tokens=token_estimate_from_payload(payload)+token_estimate_from_payload(parsed), model="offline_proxy")
+                        diag = normalize_diag(parsed)
+                else:
+                    raise ValueError(method)
+
+                action = action_from_diagnosis(diag)
+                exp_score = explanation_score(diag, sc)
+                resamp = resample_success(diag, sc, trace_f2e.gt_last)
+                correct = int(diag.get("accident_type") == sc.accident_type)
+                diag_rows.append({
+                    "layer": "high_level_diagnosis",
+                    "seed_index": epi,
+                    "seed": seed,
+                    "scenario_id": sc.scenario_id,
+                    "method": method,
+                    "ground_truth": sc.accident_type,
+                    "prediction": diag.get("accident_type"),
+                    "correct": correct,
+                    "ambiguous": sc.ambiguous,
+                    "unseen_combo": sc.unseen_combo,
+                    "expected_review": sc.expected_review,
+                    "review_needed": diag.get("review_needed"),
+                    "confidence": diag.get("confidence"),
+                    "explanation_correctness": round(float(exp_score), 6),
+                    "prompt_tokens": call_res.prompt_tokens,
+                    "completion_tokens": call_res.completion_tokens,
+                    "total_tokens": call_res.total_tokens,
+                    "api_latency_ms": round(float(call_res.latency_ms), 3),
+                    "model": call_res.model,
+                    "from_cache": call_res.from_cache,
+                    "api_ok": call_res.ok,
+                    "api_error": call_res.error,
+                    "explanation": diag.get("explanation"),
+                })
+                is_actionable_gt = sc.accident_type not in {"normal", "needs_review_unknown"}
+                action_rows.append({
+                    "layer": "action_decision",
+                    "seed_index": epi,
+                    "seed": seed,
+                    "scenario_id": sc.scenario_id,
+                    "method": method,
+                    "ground_truth": sc.accident_type,
+                    "is_actionable_gt": int(is_actionable_gt),
+                    "confirm_abnormal": int(action["confirm_abnormal"]),
+                    "mark_review": int(action["mark_review"]),
+                    "expected_review": int(sc.expected_review),
+                    "filter_as_low_confidence_fp": int(action["filter_as_low_confidence_fp"]),
+                    "resampling_success": resamp,
+                    "diagnosis_latency_ms": round(float(call_res.latency_ms), 3),
+                    "total_tokens": call_res.total_tokens,
+                })
+                job += 1
+                progress.update(job, f"L2/L3 seed={epi+1}/{seeds} scenario={sc.scenario_id} method={method}")
+    return diag_rows, action_rows, job
+
+def aggregate_layer2(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        groups.setdefault(r["method"], []).append(r)
+    out = []
+    for method, rs in sorted(groups.items()):
+        y_true = [r["ground_truth"] for r in rs]
+        y_pred = [r["prediction"] for r in rs]
+        amb = [r for r in rs if r.get("ambiguous")]
+        unseen = [r for r in rs if r.get("unseen_combo")]
+        hard = [r for r in rs if r.get("ambiguous") or r.get("unseen_combo") or r.get("expected_review")]
+        composite = [r for r in rs if r.get("ground_truth") == "composite_anomaly"]
+        low_snr = [r for r in rs if r.get("ground_truth") == "low_snr_anomaly"]
+        expected_review = [r for r in rs if r.get("expected_review")]
+        out.append({
+            "method": method,
+            "n": len(rs),
+            "accident_classification_accuracy": round(float(np.mean([r.get("correct", 0) for r in rs])), 6) if rs else None,
+            "macro_f1": round(float(macro_f1(y_true, y_pred, ACCIDENT_TYPES)), 6) if macro_f1(y_true, y_pred, ACCIDENT_TYPES) is not None else None,
+            "ambiguous_case_accuracy": round(float(np.mean([r.get("correct", 0) for r in amb])), 6) if amb else None,
+            "hard_case_accuracy": round(float(np.mean([r.get("correct", 0) for r in hard])), 6) if hard else None,
+            "unseen_combination_accuracy": round(float(np.mean([r.get("correct", 0) for r in unseen])), 6) if unseen else None,
+            "composite_accuracy": round(float(np.mean([r.get("correct", 0) for r in composite])), 6) if composite else None,
+            "low_snr_accuracy": round(float(np.mean([r.get("correct", 0) for r in low_snr])), 6) if low_snr else None,
+            "expected_review_success": round(float(np.mean([1 if r.get("review_needed") else 0 for r in expected_review])), 6) if expected_review else None,
+            "explanation_correctness": round(float(safe_mean([r.get("explanation_correctness") for r in rs])), 6) if safe_mean([r.get("explanation_correctness") for r in rs]) is not None else None,
+            "mean_prompt_tokens": round(float(safe_mean([r.get("prompt_tokens") for r in rs])), 3) if safe_mean([r.get("prompt_tokens") for r in rs]) is not None else None,
+            "mean_completion_tokens": round(float(safe_mean([r.get("completion_tokens") for r in rs])), 3) if safe_mean([r.get("completion_tokens") for r in rs]) is not None else None,
+            "mean_total_tokens": round(float(safe_mean([r.get("total_tokens") for r in rs])), 3) if safe_mean([r.get("total_tokens") for r in rs]) is not None else None,
+            "mean_api_latency_ms": round(float(safe_mean([r.get("api_latency_ms") for r in rs])), 3) if safe_mean([r.get("api_latency_ms") for r in rs]) is not None else None,
+            "api_success_rate": round(float(np.mean([1 if r.get("api_ok") else 0 for r in rs])), 6) if rs else None,
+        })
+    return out
+
+def aggregate_layer3(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        groups.setdefault(r["method"], []).append(r)
+    out = []
+    for method, rs in sorted(groups.items()):
+        tp_action = sum(1 for r in rs if r["confirm_abnormal"] and r["is_actionable_gt"])
+        fp_action = sum(1 for r in rs if r["confirm_abnormal"] and not r["is_actionable_gt"])
+        fn_action = sum(1 for r in rs if (not r["confirm_abnormal"]) and r["is_actionable_gt"])
+        p, rec, _ = precision_recall_f1(tp_action, fp_action, fn_action)
+        review_rows = [r for r in rs if r["mark_review"]]
+        expected_review_rows = [r for r in rs if r["expected_review"]]
+        review_precision = sum(1 for r in review_rows if r["expected_review"]) / len(review_rows) if review_rows else None
+        review_recall = sum(1 for r in expected_review_rows if r["mark_review"]) / len(expected_review_rows) if expected_review_rows else None
+        active_steps = len(rs)
+        false_positive_active = fp_action / max(1, active_steps)
+        out.append({
+            "method": method,
+            "n": len(rs),
+            "actionable_precision": round(float(p), 6) if p is not None else None,
+            "actionable_recall": round(float(rec), 6) if rec is not None else None,
+            "false_positives_per_active_step": round(float(false_positive_active), 6),
+            "review_precision": round(float(review_precision), 6) if review_precision is not None else None,
+            "review_recall": round(float(review_recall), 6) if review_recall is not None else None,
+            "resampling_success_rate": round(float(safe_mean([r.get("resampling_success") for r in rs])), 6) if safe_mean([r.get("resampling_success") for r in rs]) is not None else None,
+            "diagnosis_latency_ms": round(float(safe_mean([r.get("diagnosis_latency_ms") for r in rs])), 3) if safe_mean([r.get("diagnosis_latency_ms") for r in rs]) is not None else None,
+            "mean_total_tokens": round(float(safe_mean([r.get("total_tokens") for r in rs])), 3) if safe_mean([r.get("total_tokens") for r in rs]) is not None else None,
+        })
+    return out
+
+# ============================================================
+# Main
+# ============================================================
+def parse_layers(text: str) -> List[int]:
+    if text == "all":
+        return [1, 2, 3]
+    out = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        val = int(part)
+        if val not in {1, 2, 3}:
+            raise ValueError("layers must be all or comma-separated values from 1,2,3")
+        out.append(val)
+    return sorted(set(out))
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=f"{COMPARISON_VERSION} comprehensive F2E/LLM/VLM comparison experiments")
+    ap.add_argument("--profile", choices=["quick", "paper", "hard"], default="quick")
+    ap.add_argument("--layers", default="all", help="all or comma-separated subset: 1,2,3")
+    ap.add_argument("--seeds", type=int, default=None)
+    ap.add_argument("--steps", type=int, default=None)
+    ap.add_argument("--max-scenarios", type=int, default=None)
+    ap.add_argument("--obs-ratio", type=float, default=DEFAULT_OBS_RATIO)
+    ap.add_argument("--seed", type=int, default=2026)
+    ap.add_argument("--out-dir", type=str, default="outputs/comprehensive_v8_2_1")
+    ap.add_argument("--api-mode", choices=["offline", "auto", "api"], default="auto", help="offline: no API; auto: call API only if key exists; api: require/call API")
+    ap.add_argument("--llm-model", default="qwen3.6-flash", help="model for text/event/matrix LLM comparisons")
+    ap.add_argument("--vlm-model", default="qwen3-vl-flash", help="model for raw image + VLM comparison")
+    ap.add_argument("--vlm-frame-mode", choices=["last", "sampled", "all"], default="sampled", help="raw_field_image+VLM input: last frame, sampled contact sheet, or all-frame contact sheet")
+    ap.add_argument("--vlm-num-frames", type=int, default=8, help="number of sampled frames for --vlm-frame-mode sampled")
+    ap.add_argument("--dashscope-base-url", default=os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"))
+    ap.add_argument("--enable-thinking", action="store_true", help="enable DashScope thinking mode. Default off for fair latency/token comparison.")
+    ap.add_argument("--api-timeout", type=float, default=60.0)
+    ap.add_argument("--progress", choices=["on", "off"], default="on")
+    ap.add_argument("--progress-interval", type=float, default=2.0)
+    args = ap.parse_args()
+
+    layers = parse_layers(args.layers)
+    seeds = args.seeds if args.seeds is not None else (1 if args.profile == "quick" else 10)
+    steps = args.steps if args.steps is not None else (90 if args.profile == "quick" else 170)
+    scenarios = make_accident_scenarios(args.profile)
+    if args.max_scenarios is not None:
+        scenarios = scenarios[:args.max_scenarios]
+
+    detector_names = ["threshold_cc", "cusum_ewma", "vision_heatmap", "f2e_encoder"]
+    total_jobs = 0
+    if 1 in layers:
+        total_jobs += seeds * len(scenarios) * len(detector_names)
+    if 2 in layers or 3 in layers:
+        total_jobs += seeds * len(scenarios) * 6
+    progress = ProgressMeter(total_jobs, enabled=args.progress == "on", interval_sec=args.progress_interval)
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    api_key = os.getenv("DASHSCOPE_API_KEY")
+    if args.api_mode == "api" and not api_key:
+        print("ERROR: --api-mode api requires DASHSCOPE_API_KEY in the environment.", file=sys.stderr)
+        sys.exit(2)
+    client = DashScopeClient(
+        api_key=api_key,
+        base_url=args.dashscope_base_url,
+        cache_path=os.path.join(args.out_dir, "dashscope_cache.json"),
+        enable_thinking=args.enable_thinking,
+        timeout=args.api_timeout,
+    )
+
+    t0 = time.perf_counter()
+    job = 0
+    layer1_rows: List[Dict[str, Any]] = []
+    layer2_rows: List[Dict[str, Any]] = []
+    layer3_rows: List[Dict[str, Any]] = []
+    progress.update(0, "starting")
+    if 1 in layers:
+        layer1_rows, job = run_layer1(scenarios, seeds, steps, args.obs_ratio, args.seed, detector_names, progress, job)
+    if 2 in layers or 3 in layers:
+        layer2_rows, layer3_rows, job = run_layers23(scenarios, seeds, steps, args.obs_ratio, args.seed, args.out_dir,
+                                                     args.api_mode, client, args.llm_model, args.vlm_model, progress, job,
+                                                     args.vlm_frame_mode, args.vlm_num_frames)
+    progress.update(total_jobs, "done")
+
+    layer1_summary = aggregate_layer1(layer1_rows) if layer1_rows else []
+    layer2_summary = aggregate_layer2(layer2_rows) if layer2_rows else []
+    layer3_summary = aggregate_layer3(layer3_rows) if layer3_rows else []
+
+    run_config = {
+        "version": COMPARISON_VERSION,
+        "core_version": CORE_VERSION,
+        "profile": args.profile,
+        "layers": layers,
+        "seeds": seeds,
+        "steps": steps,
+        "n_scenarios": len(scenarios),
+        "scenario_ids": [s.scenario_id for s in scenarios],
+        "obs_ratio": args.obs_ratio,
+        "api_mode": args.api_mode,
+        "api_key_present": bool(api_key),
+        "llm_model": args.llm_model,
+        "vlm_model": args.vlm_model,
+        "vlm_frame_mode": args.vlm_frame_mode,
+        "vlm_num_frames": args.vlm_num_frames,
+        "dashscope_base_url": args.dashscope_base_url,
+        "enable_thinking": bool(args.enable_thinking),
+        "wall_time_sec": round(float(time.perf_counter() - t0), 3),
+        "note": "DASHSCOPE_API_KEY is read from environment and is never saved in outputs.",
+    }
+    payload = {
+        "run_config": run_config,
+        "layer1_detection_summary": layer1_summary,
+        "layer2_diagnosis_summary": layer2_summary,
+        "layer3_action_summary": layer3_summary,
+        "layer1_rows": layer1_rows,
+        "layer2_rows": layer2_rows,
+        "layer3_rows": layer3_rows,
+    }
+    with open(os.path.join(args.out_dir, "comprehensive_comparison_results.json"), "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(args.out_dir, "run_config.json"), "w", encoding="utf-8") as f:
+        json.dump(run_config, f, ensure_ascii=False, indent=2)
+    save_csv(os.path.join(args.out_dir, "layer1_detection_records.csv"), layer1_rows)
+    save_csv(os.path.join(args.out_dir, "layer1_detection_summary.csv"), layer1_summary)
+    save_csv(os.path.join(args.out_dir, "layer2_diagnosis_records.csv"), layer2_rows)
+    save_csv(os.path.join(args.out_dir, "layer2_diagnosis_summary.csv"), layer2_summary)
+    save_csv(os.path.join(args.out_dir, "layer3_action_records.csv"), layer3_rows)
+    save_csv(os.path.join(args.out_dir, "layer3_action_summary.csv"), layer3_summary)
+
+    print(f"\n===== Comprehensive F2E/LLM/VLM Comparison {COMPARISON_VERSION} =====")
+    print(f"core={CORE_VERSION} profile={args.profile} layers={layers} seeds={seeds} steps={steps} scenarios={len(scenarios)}")
+    print(f"api_mode={args.api_mode} api_key_present={bool(api_key)} llm_model={args.llm_model} vlm_model={args.vlm_model} vlm_frame_mode={args.vlm_frame_mode} vlm_num_frames={args.vlm_num_frames} thinking={args.enable_thinking}")
+    print("NO-LEAK CHECK: the F2E encoder is called only via update(t, current_fields); GT masks and accident labels remain in the evaluator.")
+    if layer1_summary:
+        print("\nLayer 1 summary:")
+        for r in layer1_summary:
+            print(f"  {r['detector']}: F1={r.get('detection_f1')} IoU={r.get('mean_iou')} centroid={r.get('centroid_error')} FP100={r.get('normal_fp_per_100_frames')} latency={r.get('latency_ms_per_frame')}ms/frame")
+    if layer2_summary:
+        print("\nLayer 2 summary:")
+        for r in layer2_summary:
+            print(f"  {r['method']}: acc={r.get('accident_classification_accuracy')} macroF1={r.get('macro_f1')} ambiguous={r.get('ambiguous_case_accuracy')} unseen={r.get('unseen_combination_accuracy')} tokens={r.get('mean_total_tokens')} latency={r.get('mean_api_latency_ms')}ms")
+    if layer3_summary:
+        print("\nLayer 3 summary:")
+        for r in layer3_summary:
+            print(f"  {r['method']}: actP={r.get('actionable_precision')} actR={r.get('actionable_recall')} reviewP={r.get('review_precision')} resample={r.get('resampling_success_rate')} tokens={r.get('mean_total_tokens')}")
+    print("\nSaved:")
+    for name in [
+        "comprehensive_comparison_results.json", "run_config.json",
+        "layer1_detection_records.csv", "layer1_detection_summary.csv",
+        "layer2_diagnosis_records.csv", "layer2_diagnosis_summary.csv",
+        "layer3_action_records.csv", "layer3_action_summary.csv",
+    ]:
+        print("  " + os.path.join(args.out_dir, name))
+
+if __name__ == "__main__":
+    main()
