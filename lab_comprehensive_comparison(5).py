@@ -1,6 +1,6 @@
 """Comprehensive comparison experiments for Field-to-Event (F2E) + LLM systems.
 
-Version: v8.2.4
+Version: v8.2.7
 
 This script is intentionally an experiment/evaluation layer only.  It imports the
 core no-leak F2E encoder from University_Field_to_Event_Encoder.py and never
@@ -68,7 +68,7 @@ from University_Field_to_Event_Encoder import (
     nearest_free,
 )
 
-COMPARISON_VERSION = "v8.2.5"
+COMPARISON_VERSION = "v8.2.7"
 
 ACCIDENT_TYPES = [
     "fire",
@@ -217,6 +217,14 @@ class AccidentScenario:
     notes: str = ""
     challenge: str = ""
     llm_advantage: str = ""
+    hard_family: str = "standard"
+    diagnostic_goal: str = "exact_label"
+    expected_event_signatures: Tuple[str, ...] = ()
+    forbidden_predictions: Tuple[str, ...] = ()
+    acceptable_predictions: Tuple[str, ...] = ()
+
+def event_signature(field_key: str, polarity: str) -> str:
+    return f"{field_key}:{polarity}"
 
 def effect(eid: str, field_key: str, polarity: str, shape: str, center: Tuple[float, float],
            area: str = "stable", intensity: str = "stable", amp: float = 3.5,
@@ -314,10 +322,18 @@ def make_accident_scenarios(profile: str = "paper") -> List[AccidentScenario]:
                 effect("AQI_comp", "air_quality", "high", "blob", (12, 12), "expanding", "strengthening", 2.8),
                 effect("H_comp", "humidity", "high", "elongated_strip", (20, 19), "expanding", "stable", 3.2, angle=1.3),
             ]),
-            ambiguous=True, unseen_combo=True, explanation_fields=("temperature", "air_quality", "humidity"), target_field="temperature",
+            ambiguous=True, unseen_combo=False, explanation_fields=("temperature", "air_quality", "humidity"), target_field="temperature",
             notes="Composite anomaly: traditional single-rule systems often misclassify into one incident.",
             challenge="composite_anomaly",
             llm_advantage="Joint fire-like and leak-like evidence should be reported as composite rather than forced into one rule label.",
+            hard_family="composite_generalization",
+            diagnostic_goal="composite",
+            expected_event_signatures=(
+                event_signature("temperature", "high"),
+                event_signature("air_quality", "high"),
+                event_signature("humidity", "high"),
+            ),
+            forbidden_predictions=("fire", "water_leak", "steam_leak"),
         ),
         AccidentScenario(
             "low_snr_multi_field", "low_snr_anomaly",
@@ -331,6 +347,15 @@ def make_accident_scenarios(profile: str = "paper") -> List[AccidentScenario]:
             notes="Low SNR: a strong system should combine weak trends and may request review.",
             challenge="low_snr_multi_field",
             llm_advantage="Weak evidence across several fields should be integrated with calibrated uncertainty instead of hard thresholding.",
+            hard_family="weak_evidence_integration",
+            diagnostic_goal="weak_evidence",
+            expected_event_signatures=(
+                event_signature("temperature", "high"),
+                event_signature("co2", "high"),
+                event_signature("air_quality", "high"),
+            ),
+            acceptable_predictions=("low_snr_anomaly", "needs_review_unknown"),
+            forbidden_predictions=("normal",),
         ),
         AccidentScenario(
             "missing_low_confidence_region", "needs_review_unknown",
@@ -343,6 +368,14 @@ def make_accident_scenarios(profile: str = "paper") -> List[AccidentScenario]:
             notes="Missing/low-confidence region should produce review rather than a brittle hard label.",
             challenge="missing_or_low_confidence_region",
             llm_advantage="Missing observations should trigger review/resampling instead of forcing an overconfident diagnosis.",
+            hard_family="uncertainty_review",
+            diagnostic_goal="review_low_confidence",
+            expected_event_signatures=(
+                event_signature("humidity", "high"),
+                event_signature("temperature", "high"),
+            ),
+            acceptable_predictions=("needs_review_unknown",),
+            forbidden_predictions=("water_leak", "steam_leak", "fire"),
         ),
         AccidentScenario(
             "unseen_pressure_aqi_combo", "needs_review_unknown",
@@ -355,6 +388,75 @@ def make_accident_scenarios(profile: str = "paper") -> List[AccidentScenario]:
             notes="Unseen combination tests generalization and calibrated review behavior.",
             challenge="unseen_field_combination",
             llm_advantage="The pattern is outside the known accident templates, so generalized reasoning should prefer review.",
+            hard_family="ood_template_rejection",
+            diagnostic_goal="template_rejection",
+            expected_event_signatures=(
+                event_signature("pressure", "high"),
+                event_signature("air_quality", "high"),
+                event_signature("humidity", "low"),
+            ),
+            acceptable_predictions=("needs_review_unknown",),
+            forbidden_predictions=("dust_pollution", "steam_leak", "co2_accumulation"),
+        ),
+        AccidentScenario(
+            "unseen_temp_pressure_drop_combo", "needs_review_unknown",
+            TestCase("unseen_temp_pressure_drop_combo", [
+                effect("T_unseen_pd", "temperature", "high", "compact_blob", (12, 17), "stable", "strengthening", 3.1),
+                effect("P_unseen_pd", "pressure", "low", "compact_blob", (12, 17), "stable", "strengthening", 2.7),
+            ]),
+            ambiguous=True, unseen_combo=True, expected_review=True, explanation_fields=("temperature", "pressure"), target_field="pressure",
+            notes="High temperature coupled with pressure drop is outside the known fire/electrical/steam templates.",
+            challenge="unseen_field_combination",
+            llm_advantage="The model should reject the tempting electrical-overheat label because the pressure-drop evidence is contradictory.",
+            hard_family="ood_template_rejection",
+            diagnostic_goal="template_rejection",
+            expected_event_signatures=(
+                event_signature("temperature", "high"),
+                event_signature("pressure", "low"),
+            ),
+            acceptable_predictions=("needs_review_unknown",),
+            forbidden_predictions=("electrical_overheat", "fire", "steam_leak"),
+        ),
+        AccidentScenario(
+            "unseen_co2_pressure_rise_combo", "needs_review_unknown",
+            TestCase("unseen_co2_pressure_rise_combo", [
+                effect("CO2_unseen_pr", "co2", "high", "oval", (17, 12), "expanding", "strengthening", 3.0),
+                effect("P_unseen_pr", "pressure", "high", "compact_blob", (17, 12), "stable", "strengthening", 2.4),
+            ]),
+            ambiguous=True, unseen_combo=True, expected_review=True, explanation_fields=("co2", "pressure"), target_field="co2",
+            notes="CO2 rise with pressure rise is a process-upset pattern not covered by the known accident labels.",
+            challenge="unseen_field_combination",
+            llm_advantage="Generalized reasoning should not collapse this novel coupled pattern into CO2 accumulation without review.",
+            hard_family="ood_template_rejection",
+            diagnostic_goal="template_rejection",
+            expected_event_signatures=(
+                event_signature("co2", "high"),
+                event_signature("pressure", "high"),
+            ),
+            acceptable_predictions=("needs_review_unknown",),
+            forbidden_predictions=("co2_accumulation", "steam_leak"),
+        ),
+        AccidentScenario(
+            "low_confidence_fire_like_region", "needs_review_unknown",
+            TestCase("low_confidence_fire_like_region", [
+                effect("T_lc_fire", "temperature", "high", "blob", (15, 15), "expanding", "strengthening", 3.4),
+                effect("AQI_lc_fire", "air_quality", "high", "blob", (15, 16), "expanding", "strengthening", 2.7),
+                effect("CO2_lc_fire", "co2", "high", "compact_blob", (16, 15), "stable", "strengthening", 2.2),
+            ]),
+            stress=StressConfig("occlusion_35_fire_like", occlusion_rate=0.35, anomaly_scale=0.85),
+            ambiguous=True, expected_review=True, explanation_fields=("temperature", "air_quality", "co2"), target_field="temperature",
+            notes="Fire-like evidence is present but heavy missingness should force calibrated review rather than a brittle hard fire label.",
+            challenge="missing_or_low_confidence_region",
+            llm_advantage="The LLM should integrate event evidence with observation quality and request review instead of over-calling fire.",
+            hard_family="uncertainty_review",
+            diagnostic_goal="review_low_confidence",
+            expected_event_signatures=(
+                event_signature("temperature", "high"),
+                event_signature("air_quality", "high"),
+                event_signature("co2", "high"),
+            ),
+            acceptable_predictions=("needs_review_unknown",),
+            forbidden_predictions=("fire",),
         ),
         AccidentScenario(
             "normal_no_incident", "normal",
@@ -370,17 +472,21 @@ def make_accident_scenarios(profile: str = "paper") -> List[AccidentScenario]:
         keep = {"fire_vs_overheat__fire", "water_vs_steam__steam", "low_snr_multi_field", "normal_no_incident"}
         return [s for s in scenarios if s.scenario_id in keep]
     if profile == "hard":
-        # Hard set designed to expose LLM-level advantages: ambiguous, composite,
-        # low-SNR, missing-confidence, and unseen combinations.
+        # Hard set designed to expose LLM-level advantages: template
+        # disambiguation, composite reasoning, calibrated review, weak evidence,
+        # and OOD template rejection.  It intentionally contains more
+        # ambiguous/review/OOD cases than the balanced paper profile.
         keep = {
             "fire_vs_overheat__electrical",
             "water_vs_steam__water",
-            "co2_vs_dust__co2",
             "co2_vs_dust__dust",
             "composite_fire_and_leak",
             "low_snr_multi_field",
             "missing_low_confidence_region",
             "unseen_pressure_aqi_combo",
+            "unseen_temp_pressure_drop_combo",
+            "unseen_co2_pressure_rise_combo",
+            "low_confidence_fire_like_region",
             "normal_no_incident",
         }
         return [s for s in scenarios if s.scenario_id in keep]
@@ -771,6 +877,31 @@ def observation_quality(fields_by_t: List[Dict[str, np.ndarray]], free_mask: np.
         "high_noise_fields": [k for k, v in per_field.items() if (v["recent_diff_noise_sigma"] is not None and float(v["recent_diff_noise_sigma"]) >= 0.20)],
         "per_field": per_field,
     }
+
+
+
+def blind_artifact_stem(seed: int, scenario_index: int, method_tag: str, mode: str) -> str:
+    """Anonymized artifact stem for model-visible VLM images.
+
+    Do not include scenario_id, accident_type, challenge names, or other labels
+    in image filenames/titles.  The image bytes are what the VLM receives; local
+    filenames are normally not sent, but keeping them anonymous prevents
+    accidental leakage through prompts, debugging, or exported logs.
+    """
+    raw = f"{int(seed)}:{int(scenario_index)}:{method_tag}:{mode}".encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()[:10]
+    return f"blind_case_{scenario_index:03d}_seed_{int(seed)}_{digest}_{mode}"
+
+
+def blind_vlm_title(mode: str, frame_indices: Optional[Sequence[int]] = None) -> str:
+    """Neutral image title rendered into VLM contact sheets.
+
+    It intentionally excludes scenario_id and accident_type.  Frame indices are
+    harmless timing metadata and are useful for interpreting temporal trends.
+    """
+    if frame_indices:
+        return f"Temporal multi-field observation | mode={mode} | frames={list(frame_indices)}"
+    return f"Temporal multi-field observation | mode={mode}"
 
 
 def render_fields_image(fields: Dict[str, np.ndarray], out_path: str, title: str = "fields") -> Optional[str]:
@@ -1496,7 +1627,10 @@ def build_diagnosis_prompt(input_kind: str, scenario_payload: Dict[str, Any]) ->
         "The JSON schema is: {\"accident_type\": str, \"confidence\": float, "
         "\"review_needed\": bool, \"abnormal_confirmed\": bool, "
         "\"resample_target\": {\"field_key\": str|null, \"centroid\": [row,col]|null}|null, "
-        "\"evidence_fields\": [str], \"explanation\": str}. "
+        "\"evidence_fields\": [str], "
+        "\"evidence_events\": [{\"field_key\": str, \"polarity\": \"high\"|\"low\", \"role\": str}], "
+        "\"template_status\": \"known_template\"|\"composite\"|\"novel_combination\"|\"insufficient_data\", "
+        "\"explanation\": str}. "
         "Use only the provided observation representation. Do not assume hidden labels. "
         "Decision guidance: fire requires high temperature plus combustion-side AQI/CO2 evidence; "
         "electrical_overheat is mainly isolated high temperature without AQI/CO2/humidity support; "
@@ -1508,7 +1642,8 @@ def build_diagnosis_prompt(input_kind: str, scenario_payload: Dict[str, Any]) ->
         "If event evidence is empty and observation quality is good, prefer normal. "
         "If evidence is missing, low-confidence, or outside known templates, prefer needs_review_unknown and set review_needed=true. "
         "For low-SNR evidence, use low_snr_anomaly only when weak but coherent multi-field trends are present; otherwise request review. "
-        "In the explanation, explicitly cite the fields and trends used."
+        "In evidence_events, list only observation-derived fields used for the diagnosis, with polarity when available. "
+        "In the explanation, explicitly cite the fields, polarities, and trends used."
     )
     user = {
         "input_kind": input_kind,
@@ -1525,7 +1660,7 @@ def build_vlm_messages(image_data_url: str, scenario_payload: Dict[str, Any]) ->
         "Rows correspond to physical fields and columns correspond to sampled times. "
         "Use temporal changes, co-location across fields, and missing/low-confidence evidence. "
         "Return only JSON with keys: accident_type, confidence, review_needed, abnormal_confirmed, "
-        "resample_target, evidence_fields, explanation. "
+        "resample_target, evidence_fields, evidence_events, template_status, explanation. "
         "Composite anomaly requires distinct coexisting incident patterns, not merely several coupled fields. "
         "If the image is ambiguous or affected by missing data, choose needs_review_unknown.\n"
         + json.dumps(scenario_payload, ensure_ascii=False)
@@ -1601,7 +1736,7 @@ def aggregate_layer1(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # ============================================================
 def normalize_diag(diag: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not isinstance(diag, dict):
-        return {"accident_type": "needs_review_unknown", "confidence": 0.0, "review_needed": True, "abnormal_confirmed": False, "resample_target": None, "evidence_fields": [], "explanation": "invalid or missing model output"}
+        return {"accident_type": "needs_review_unknown", "confidence": 0.0, "review_needed": True, "abnormal_confirmed": False, "resample_target": None, "evidence_fields": [], "evidence_events": [], "template_status": "invalid_output", "explanation": "invalid or missing model output"}
     label = str(diag.get("accident_type", "needs_review_unknown"))
     if label not in ACCIDENT_TYPES:
         label = "needs_review_unknown"
@@ -1616,6 +1751,8 @@ def normalize_diag(diag: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "abnormal_confirmed": bool(diag.get("abnormal_confirmed", label not in {"normal", "needs_review_unknown"} and conf >= 0.55)),
         "resample_target": diag.get("resample_target"),
         "evidence_fields": diag.get("evidence_fields", []) if isinstance(diag.get("evidence_fields", []), list) else [],
+        "evidence_events": diag.get("evidence_events", []) if isinstance(diag.get("evidence_events", []), list) else [],
+        "template_status": str(diag.get("template_status", "")),
         "explanation": str(diag.get("explanation", "")),
     }
 
@@ -1626,6 +1763,190 @@ def explanation_score(diag: Dict[str, Any], scenario: AccidentScenario) -> float
     text = (diag.get("explanation", "") + " " + " ".join(map(str, diag.get("evidence_fields", [])))).lower()
     hits = sum(1 for f in req if f.lower() in text)
     return hits / max(1, len(req))
+
+def f1_from_sets(expected: set, reported: set) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    if not expected and not reported:
+        return 1.0, 1.0, 1.0
+    if not expected:
+        return None, 0.0 if reported else 1.0, None
+    tp = len(expected & reported)
+    precision = tp / len(reported) if reported else 0.0
+    recall = tp / len(expected)
+    f1 = 0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)
+    return precision, recall, f1
+
+def scenario_expected_signatures(scenario: AccidentScenario) -> set:
+    if scenario.expected_event_signatures:
+        return set(scenario.expected_event_signatures)
+    return {event_signature(e.field_key, e.polarity) for e in scenario.testcase.effects}
+
+def signature_field(sig: str) -> str:
+    return sig.split(":", 1)[0]
+
+def _text_mentions_field(text: str, field_key: str) -> bool:
+    aliases = {
+        "temperature": ("temperature", "thermal", "heat", "hotspot", "hot"),
+        "humidity": ("humidity", "moisture", "wet", "dry"),
+        "pressure": ("pressure", "pressure_rise", "pressure_drop"),
+        "co2": ("co2", "carbon dioxide"),
+        "air_quality": ("air_quality", "air quality", "aqi", "dust", "particulate"),
+    }
+    low = text.lower()
+    return any(alias in low for alias in aliases.get(field_key, (field_key,)))
+
+def reported_evidence_fields(diag: Dict[str, Any]) -> set:
+    fields = set()
+    for item in diag.get("evidence_fields", []):
+        text = str(item).lower()
+        for f in FIELDS:
+            if f.lower() == text or _text_mentions_field(text, f):
+                fields.add(f)
+    for item in diag.get("evidence_events", []):
+        if isinstance(item, dict):
+            f = str(item.get("field_key", "")).lower()
+            if f in FIELDS:
+                fields.add(f)
+    text = (diag.get("explanation", "") or "")
+    for f in FIELDS:
+        if _text_mentions_field(text, f):
+            fields.add(f)
+    return fields
+
+def reported_event_signatures(diag: Dict[str, Any]) -> set:
+    signatures = set()
+    for item in diag.get("evidence_events", []):
+        if not isinstance(item, dict):
+            continue
+        field_key = str(item.get("field_key", "")).lower()
+        polarity = str(item.get("polarity", "")).lower()
+        if field_key in FIELDS and polarity in {"high", "low"}:
+            signatures.add(event_signature(field_key, polarity))
+    for item in diag.get("evidence_fields", []):
+        text = str(item).lower().replace(" ", "")
+        if ":" in text:
+            field_key, polarity = text.split(":", 1)
+            if field_key in FIELDS and polarity in {"high", "low"}:
+                signatures.add(event_signature(field_key, polarity))
+    return signatures
+
+def evidence_alignment_scores(diag: Dict[str, Any], scenario: AccidentScenario) -> Dict[str, Any]:
+    expected_signatures = scenario_expected_signatures(scenario)
+    expected_fields = {signature_field(sig) for sig in expected_signatures}
+    reported_fields = reported_evidence_fields(diag)
+    reported_signatures = reported_event_signatures(diag)
+    fp, fr, ff1 = f1_from_sets(expected_fields, reported_fields)
+    sp, sr, sf1 = f1_from_sets(expected_signatures, reported_signatures)
+
+    if not expected_signatures:
+        partial_signature = 1.0 if not reported_signatures else 0.0
+    else:
+        partial_scores = []
+        for sig in expected_signatures:
+            if sig in reported_signatures:
+                partial_scores.append(1.0)
+            elif signature_field(sig) in reported_fields:
+                partial_scores.append(0.5)
+            else:
+                partial_scores.append(0.0)
+        partial_signature = float(np.mean(partial_scores)) if partial_scores else 1.0
+
+    return {
+        "expected_evidence_fields": sorted(expected_fields),
+        "expected_event_signatures": sorted(expected_signatures),
+        "reported_evidence_fields": sorted(reported_fields),
+        "reported_event_signatures": sorted(reported_signatures),
+        "evidence_field_precision": fp,
+        "evidence_field_recall": fr,
+        "evidence_field_f1": ff1,
+        "evidence_signature_precision": sp,
+        "evidence_signature_recall": sr,
+        "evidence_signature_f1": sf1,
+        "evidence_signature_alignment": partial_signature,
+    }
+
+def behavior_goal_score(diag: Dict[str, Any], scenario: AccidentScenario) -> float:
+    pred = str(diag.get("accident_type", "needs_review_unknown"))
+    review = bool(diag.get("review_needed"))
+    acceptable = set(scenario.acceptable_predictions or (scenario.accident_type,))
+    goal = scenario.diagnostic_goal
+
+    if goal in {"template_rejection", "review_low_confidence"}:
+        if pred == "needs_review_unknown" and review:
+            return 1.0
+        if pred in acceptable and review:
+            return 0.85
+        if review:
+            return 0.45
+        return 0.0
+    if goal == "weak_evidence":
+        if pred == "low_snr_anomaly":
+            return 1.0
+        if pred == "needs_review_unknown" and review:
+            return 0.70
+        if review:
+            return 0.40
+        return 0.0
+    if goal == "composite":
+        if pred == "composite_anomaly":
+            return 1.0
+        if pred == "needs_review_unknown" and review:
+            return 0.55
+        return 0.0
+    return 1.0 if pred in acceptable else 0.0
+
+def review_calibration_score(diag: Dict[str, Any], scenario: AccidentScenario) -> float:
+    review = bool(diag.get("review_needed"))
+    pred = str(diag.get("accident_type", ""))
+    if scenario.expected_review:
+        return 1.0 if review else 0.0
+    if pred == scenario.accident_type and not review:
+        return 1.0
+    if pred == scenario.accident_type and review:
+        return 0.80
+    return 0.50 if review else 0.75
+
+def resample_target_score(diag: Dict[str, Any], scenario: AccidentScenario, fields: set) -> Optional[float]:
+    if not scenario.expected_review or not scenario.target_field:
+        return None
+    target = diag.get("resample_target")
+    if isinstance(target, dict) and str(target.get("field_key", "")).lower() == scenario.target_field:
+        return 1.0
+    if scenario.target_field in fields:
+        return 0.50
+    return 0.0
+
+def forbidden_prediction_score(diag: Dict[str, Any], scenario: AccidentScenario) -> float:
+    pred = str(diag.get("accident_type", ""))
+    return 0.0 if pred in set(scenario.forbidden_predictions) else 1.0
+
+def reasoning_alignment_scores(diag: Dict[str, Any], scenario: AccidentScenario) -> Dict[str, Any]:
+    ev = evidence_alignment_scores(diag, scenario)
+    behavior = behavior_goal_score(diag, scenario)
+    review = review_calibration_score(diag, scenario)
+    resample = resample_target_score(diag, scenario, set(ev["reported_evidence_fields"]))
+    forbidden = forbidden_prediction_score(diag, scenario)
+    resample_component = 1.0 if resample is None else resample
+    alignment = (
+        0.35 * behavior
+        + 0.25 * float(ev["evidence_signature_alignment"])
+        + 0.20 * review
+        + 0.10 * resample_component
+        + 0.10 * forbidden
+    )
+    template_rejection_success = (
+        scenario.diagnostic_goal == "template_rejection"
+        and diag.get("accident_type") == "needs_review_unknown"
+        and bool(diag.get("review_needed"))
+    )
+    return {
+        **ev,
+        "behavior_goal_score": behavior,
+        "review_calibration_score": review,
+        "resample_target_match": resample,
+        "forbidden_prediction_score": forbidden,
+        "reasoning_alignment_score": alignment,
+        "template_rejection_success": int(template_rejection_success),
+    }
 
 def token_estimate_from_payload(payload: Any) -> int:
     # Coarse proxy used only when explicitly requested through --token-fallback.
@@ -1681,7 +2002,7 @@ def call_or_offline(client: DashScopeClient, api_mode: str, model: str, messages
 
 def build_method_inputs(trace_threshold: RunTrace, trace_f2e: RunTrace, image_dir: str,
                         vlm_frame_mode: str = "sampled", vlm_num_frames: int = 8,
-                        llm_interval_steps: int = 50) -> Dict[str, Dict[str, Any]]:
+                        llm_interval_steps: int = 50, scenario_index: int = 0) -> Dict[str, Dict[str, Any]]:
     diag_t = diagnosis_query_t(trace_f2e.scenario, len(trace_f2e.fields_window), llm_interval_steps)
     th_events = summarize_events(snapshot_events_at(trace_threshold, diag_t))
     f2e_events = summarize_events(snapshot_events_at(trace_f2e, diag_t))
@@ -1697,19 +2018,21 @@ def build_method_inputs(trace_threshold: RunTrace, trace_f2e: RunTrace, image_di
     image_render_latency_ms = 0.0
     if vlm_frame_mode == "last":
         image_t0 = time.perf_counter()
+        blind_stem = blind_artifact_stem(trace_f2e.seed, scenario_index, "vlm", "last")
         img_path = render_fields_image(
             fields_at_diagnosis,
-            os.path.join(image_dir, f"{trace_f2e.scenario.scenario_id}_seed{trace_f2e.seed}_last.png"),
-            trace_f2e.scenario.scenario_id,
+            os.path.join(image_dir, f"{blind_stem}.png"),
+            blind_vlm_title("last"),
         )
         image_render_latency_ms = (time.perf_counter() - image_t0) * 1000.0
         frame_indices = [int(diag_t)]
     else:
         image_t0 = time.perf_counter()
+        blind_stem = blind_artifact_stem(trace_f2e.seed, scenario_index, "vlm", f"{vlm_frame_mode}{vlm_num_frames}")
         img_path, frame_indices = render_fields_contact_sheet(
             fields_for_diagnosis,
-            os.path.join(image_dir, f"{trace_f2e.scenario.scenario_id}_seed{trace_f2e.seed}_{vlm_frame_mode}{vlm_num_frames}.png"),
-            trace_f2e.scenario.scenario_id,
+            os.path.join(image_dir, f"{blind_stem}.png"),
+            blind_vlm_title(vlm_frame_mode),
             mode=vlm_frame_mode,
             num_frames=vlm_num_frames,
         )
@@ -1730,6 +2053,7 @@ def build_method_inputs(trace_threshold: RunTrace, trace_f2e: RunTrace, image_di
             "field_summary": matrix_summary,
             "observation_quality": obs_quality,
             "image_path": img_path,
+            "image_filename_policy": "blind_no_scenario_id_no_accident_type",
             "diagnosis_t": int(diag_t),
             "vlm_frame_mode": vlm_frame_mode,
             "vlm_frame_indices": frame_indices,
@@ -1761,7 +2085,7 @@ def run_layer2(scenarios: List[AccidentScenario], seeds: int, steps: int, obs_ra
             seed = base_seed + 2000000 + 100000 * epi + 1000 * sc_idx
             trace_threshold = collect_run_trace(sc, seed, steps, "threshold_cc", obs_ratio, all_fields=True)
             trace_f2e = collect_run_trace(sc, seed, steps, "f2e_encoder", obs_ratio, all_fields=True)
-            method_inputs = build_method_inputs(trace_threshold, trace_f2e, image_dir, vlm_frame_mode, vlm_num_frames, llm_interval_steps)
+            method_inputs = build_method_inputs(trace_threshold, trace_f2e, image_dir, vlm_frame_mode, vlm_num_frames, llm_interval_steps, scenario_index=sc_idx)
             diag_t = int((method_inputs.get("diagnosis_t") or {}).get("t", steps - 1))
             f2e_history_frames = diag_t + 1
             for method in methods:
@@ -1845,6 +2169,7 @@ def run_layer2(scenarios: List[AccidentScenario], seeds: int, steps: int, obs_ra
                 measured_api_latency_ms = None if call_res.from_cache or call_res.model in {"rules", "offline_proxy"} else call_res.latency_ms
 
                 exp_score = explanation_score(diag, sc)
+                reasoning_scores = reasoning_alignment_scores(diag, sc)
                 correct = int(diag.get("accident_type") == sc.accident_type)
                 if method.startswith("threshold_events"):
                     input_event_count = len(method_inputs["threshold_events"]["events"])
@@ -1864,6 +2189,8 @@ def run_layer2(scenarios: List[AccidentScenario], seeds: int, steps: int, obs_ra
                     "ambiguous": sc.ambiguous,
                     "unseen_combo": sc.unseen_combo,
                     "expected_review": sc.expected_review,
+                    "hard_family": sc.hard_family,
+                    "diagnostic_goal": sc.diagnostic_goal,
                     "challenge": sc.challenge,
                     "diagnosis_t": diag_t,
                     "llm_interval_steps": int(llm_interval_steps),
@@ -1874,6 +2201,24 @@ def run_layer2(scenarios: List[AccidentScenario], seeds: int, steps: int, obs_ra
                     "review_needed": diag.get("review_needed"),
                     "confidence": diag.get("confidence"),
                     "explanation_correctness": round(float(exp_score), 6),
+                    "behavior_goal_score": round(float(reasoning_scores["behavior_goal_score"]), 6),
+                    "evidence_field_precision": None if reasoning_scores["evidence_field_precision"] is None else round(float(reasoning_scores["evidence_field_precision"]), 6),
+                    "evidence_field_recall": None if reasoning_scores["evidence_field_recall"] is None else round(float(reasoning_scores["evidence_field_recall"]), 6),
+                    "evidence_field_f1": None if reasoning_scores["evidence_field_f1"] is None else round(float(reasoning_scores["evidence_field_f1"]), 6),
+                    "evidence_signature_precision": None if reasoning_scores["evidence_signature_precision"] is None else round(float(reasoning_scores["evidence_signature_precision"]), 6),
+                    "evidence_signature_recall": None if reasoning_scores["evidence_signature_recall"] is None else round(float(reasoning_scores["evidence_signature_recall"]), 6),
+                    "evidence_signature_f1": None if reasoning_scores["evidence_signature_f1"] is None else round(float(reasoning_scores["evidence_signature_f1"]), 6),
+                    "evidence_signature_alignment": round(float(reasoning_scores["evidence_signature_alignment"]), 6),
+                    "review_calibration_score": round(float(reasoning_scores["review_calibration_score"]), 6),
+                    "resample_target_match": None if reasoning_scores["resample_target_match"] is None else round(float(reasoning_scores["resample_target_match"]), 6),
+                    "forbidden_prediction_score": round(float(reasoning_scores["forbidden_prediction_score"]), 6),
+                    "reasoning_alignment_score": round(float(reasoning_scores["reasoning_alignment_score"]), 6),
+                    "template_rejection_success": reasoning_scores["template_rejection_success"],
+                    "expected_evidence_fields": ";".join(reasoning_scores["expected_evidence_fields"]),
+                    "expected_event_signatures": ";".join(reasoning_scores["expected_event_signatures"]),
+                    "reported_evidence_fields": ";".join(reasoning_scores["reported_evidence_fields"]),
+                    "reported_event_signatures": ";".join(reasoning_scores["reported_event_signatures"]),
+                    "template_status": diag.get("template_status"),
                     "prompt_tokens": call_res.prompt_tokens,
                     "completion_tokens": call_res.completion_tokens,
                     "total_tokens": call_res.total_tokens,
@@ -1909,11 +2254,17 @@ def aggregate_layer2(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         groups.setdefault(r["method"], []).append(r)
     out = []
     for method, rs in sorted(groups.items()):
+        metric_mean = lambda key, subset=rs: safe_mean([r.get(key) for r in subset])
         y_true = [r["ground_truth"] for r in rs]
         y_pred = [r["prediction"] for r in rs]
         amb = [r for r in rs if r.get("ambiguous")]
         unseen = [r for r in rs if r.get("unseen_combo")]
         hard = [r for r in rs if r.get("ambiguous") or r.get("unseen_combo") or r.get("expected_review")]
+        reasoning_hard = [r for r in rs if r.get("hard_family") not in {None, "", "standard"} or r.get("ambiguous") or r.get("expected_review")]
+        ood = [r for r in rs if r.get("diagnostic_goal") == "template_rejection"]
+        uncertainty_review = [r for r in rs if r.get("diagnostic_goal") == "review_low_confidence"]
+        weak_evidence = [r for r in rs if r.get("diagnostic_goal") == "weak_evidence"]
+        composite_goal = [r for r in rs if r.get("diagnostic_goal") == "composite"]
         composite = [r for r in rs if r.get("ground_truth") == "composite_anomaly"]
         low_snr = [r for r in rs if r.get("ground_truth") == "low_snr_anomaly"]
         expected_review = [r for r in rs if r.get("expected_review")]
@@ -1939,6 +2290,29 @@ def aggregate_layer2(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "low_snr_accuracy": round(float(np.mean([r.get("correct", 0) for r in low_snr])), 6) if low_snr else None,
             "expected_review_success": round(float(np.mean([1 if r.get("review_needed") else 0 for r in expected_review])), 6) if expected_review else None,
             "explanation_correctness": round(float(safe_mean([r.get("explanation_correctness") for r in rs])), 6) if safe_mean([r.get("explanation_correctness") for r in rs]) is not None else None,
+            "behavior_goal_score": round(float(metric_mean("behavior_goal_score")), 6) if metric_mean("behavior_goal_score") is not None else None,
+            "reasoning_alignment_score": round(float(metric_mean("reasoning_alignment_score")), 6) if metric_mean("reasoning_alignment_score") is not None else None,
+            "hard_reasoning_alignment_score": round(float(metric_mean("reasoning_alignment_score", reasoning_hard)), 6) if metric_mean("reasoning_alignment_score", reasoning_hard) is not None else None,
+            "ambiguous_reasoning_alignment_score": round(float(metric_mean("reasoning_alignment_score", amb)), 6) if metric_mean("reasoning_alignment_score", amb) is not None else None,
+            "unseen_reasoning_alignment_score": round(float(metric_mean("reasoning_alignment_score", unseen)), 6) if metric_mean("reasoning_alignment_score", unseen) is not None else None,
+            "evidence_field_f1": round(float(metric_mean("evidence_field_f1")), 6) if metric_mean("evidence_field_f1") is not None else None,
+            "evidence_signature_alignment": round(float(metric_mean("evidence_signature_alignment")), 6) if metric_mean("evidence_signature_alignment") is not None else None,
+            "review_calibration_score": round(float(metric_mean("review_calibration_score")), 6) if metric_mean("review_calibration_score") is not None else None,
+            "forbidden_prediction_avoidance": round(float(metric_mean("forbidden_prediction_score")), 6) if metric_mean("forbidden_prediction_score") is not None else None,
+            "ood_template_rejection_n": len(ood),
+            "ood_template_rejection_accuracy": round(float(np.mean([r.get("correct", 0) for r in ood])), 6) if ood else None,
+            "ood_template_rejection_success": round(float(metric_mean("template_rejection_success", ood)), 6) if metric_mean("template_rejection_success", ood) is not None else None,
+            "ood_reasoning_alignment_score": round(float(metric_mean("reasoning_alignment_score", ood)), 6) if metric_mean("reasoning_alignment_score", ood) is not None else None,
+            "uncertainty_review_n": len(uncertainty_review),
+            "uncertainty_review_success": round(float(np.mean([1 if r.get("review_needed") else 0 for r in uncertainty_review])), 6) if uncertainty_review else None,
+            "uncertainty_review_accuracy": round(float(np.mean([r.get("correct", 0) for r in uncertainty_review])), 6) if uncertainty_review else None,
+            "uncertainty_review_reasoning_alignment_score": round(float(metric_mean("reasoning_alignment_score", uncertainty_review)), 6) if metric_mean("reasoning_alignment_score", uncertainty_review) is not None else None,
+            "weak_evidence_n": len(weak_evidence),
+            "weak_evidence_goal_score": round(float(metric_mean("behavior_goal_score", weak_evidence)), 6) if metric_mean("behavior_goal_score", weak_evidence) is not None else None,
+            "weak_evidence_reasoning_alignment_score": round(float(metric_mean("reasoning_alignment_score", weak_evidence)), 6) if metric_mean("reasoning_alignment_score", weak_evidence) is not None else None,
+            "composite_goal_n": len(composite_goal),
+            "composite_goal_score": round(float(metric_mean("behavior_goal_score", composite_goal)), 6) if metric_mean("behavior_goal_score", composite_goal) is not None else None,
+            "composite_reasoning_alignment_score": round(float(metric_mean("reasoning_alignment_score", composite_goal)), 6) if metric_mean("reasoning_alignment_score", composite_goal) is not None else None,
             "mean_prompt_tokens": round(float(safe_mean([r.get("prompt_tokens") for r in token_applicable_rows])), 3) if safe_mean([r.get("prompt_tokens") for r in token_applicable_rows]) is not None else None,
             "mean_completion_tokens": round(float(safe_mean([r.get("completion_tokens") for r in token_applicable_rows])), 3) if safe_mean([r.get("completion_tokens") for r in token_applicable_rows]) is not None else None,
             "mean_total_tokens": round(float(safe_mean([r.get("total_tokens") for r in token_applicable_rows])), 3) if safe_mean([r.get("total_tokens") for r in token_applicable_rows]) is not None else None,
@@ -1958,6 +2332,107 @@ def aggregate_layer2(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "cache_hit_rate": round(float(np.mean([1 if r.get("from_cache") else 0 for r in rs])), 6) if rs else None,
             "api_success_rate": round(float(np.mean([1 if r.get("api_ok") else 0 for r in rs])), 6) if rs else None,
         })
+    return out
+
+def aggregate_layer2_by_family(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for r in rows:
+        family = str(r.get("hard_family") or "standard")
+        groups.setdefault((str(r.get("method")), family), []).append(r)
+    out = []
+    for (method, family), rs in sorted(groups.items()):
+        y_true = [r["ground_truth"] for r in rs]
+        y_pred = [r["prediction"] for r in rs]
+        expected_review = [r for r in rs if r.get("expected_review")]
+        out.append({
+            "method": method,
+            "hard_family": family,
+            "n": len(rs),
+            "accuracy": round(float(np.mean([r.get("correct", 0) for r in rs])), 6) if rs else None,
+            "macro_f1": round(float(macro_f1(y_true, y_pred, ACCIDENT_TYPES)), 6) if macro_f1(y_true, y_pred, ACCIDENT_TYPES) is not None else None,
+            "behavior_goal_score": round(float(safe_mean([r.get("behavior_goal_score") for r in rs])), 6) if safe_mean([r.get("behavior_goal_score") for r in rs]) is not None else None,
+            "reasoning_alignment_score": round(float(safe_mean([r.get("reasoning_alignment_score") for r in rs])), 6) if safe_mean([r.get("reasoning_alignment_score") for r in rs]) is not None else None,
+            "evidence_field_f1": round(float(safe_mean([r.get("evidence_field_f1") for r in rs])), 6) if safe_mean([r.get("evidence_field_f1") for r in rs]) is not None else None,
+            "evidence_signature_alignment": round(float(safe_mean([r.get("evidence_signature_alignment") for r in rs])), 6) if safe_mean([r.get("evidence_signature_alignment") for r in rs]) is not None else None,
+            "review_calibration_score": round(float(safe_mean([r.get("review_calibration_score") for r in rs])), 6) if safe_mean([r.get("review_calibration_score") for r in rs]) is not None else None,
+            "expected_review_success": round(float(np.mean([1 if r.get("review_needed") else 0 for r in expected_review])), 6) if expected_review else None,
+            "template_rejection_success": round(float(safe_mean([r.get("template_rejection_success") for r in rs])), 6) if safe_mean([r.get("template_rejection_success") for r in rs]) is not None else None,
+            "forbidden_prediction_avoidance": round(float(safe_mean([r.get("forbidden_prediction_score") for r in rs])), 6) if safe_mean([r.get("forbidden_prediction_score") for r in rs]) is not None else None,
+        })
+    return out
+
+def aggregate_llm_advantage(summary_rows: List[Dict[str, Any]], target_method: str = "f2e_events_llm") -> List[Dict[str, Any]]:
+    target = next((r for r in summary_rows if r.get("method") == target_method), None)
+    if not target:
+        return []
+    metrics = [
+        "accident_classification_accuracy",
+        "macro_f1",
+        "behavior_goal_score",
+        "reasoning_alignment_score",
+        "hard_reasoning_alignment_score",
+        "ambiguous_reasoning_alignment_score",
+        "unseen_reasoning_alignment_score",
+        "ood_template_rejection_success",
+        "ood_reasoning_alignment_score",
+        "uncertainty_review_success",
+        "uncertainty_review_reasoning_alignment_score",
+        "weak_evidence_goal_score",
+        "composite_goal_score",
+        "evidence_signature_alignment",
+        "review_calibration_score",
+        "forbidden_prediction_avoidance",
+    ]
+    out = []
+    for baseline in summary_rows:
+        baseline_method = baseline.get("method")
+        if baseline_method == target_method:
+            continue
+        row = {"target_method": target_method, "baseline_method": baseline_method}
+        for metric in metrics:
+            tv = safe_mean([target.get(metric)])
+            bv = safe_mean([baseline.get(metric)])
+            row[f"{metric}_target"] = None if tv is None else round(float(tv), 6)
+            row[f"{metric}_baseline"] = None if bv is None else round(float(bv), 6)
+            row[f"{metric}_delta"] = None if tv is None or bv is None else round(float(tv - bv), 6)
+        out.append(row)
+    return out
+
+def aggregate_llm_advantage_by_family(family_rows: List[Dict[str, Any]], target_method: str = "f2e_events_llm") -> List[Dict[str, Any]]:
+    metrics = [
+        "accuracy",
+        "behavior_goal_score",
+        "reasoning_alignment_score",
+        "evidence_field_f1",
+        "evidence_signature_alignment",
+        "review_calibration_score",
+        "expected_review_success",
+        "template_rejection_success",
+        "forbidden_prediction_avoidance",
+    ]
+    target_by_family = {r.get("hard_family"): r for r in family_rows if r.get("method") == target_method}
+    out = []
+    for baseline in family_rows:
+        family = baseline.get("hard_family")
+        baseline_method = baseline.get("method")
+        if baseline_method == target_method:
+            continue
+        target = target_by_family.get(family)
+        if not target:
+            continue
+        row = {
+            "hard_family": family,
+            "target_method": target_method,
+            "baseline_method": baseline_method,
+            "n": target.get("n"),
+        }
+        for metric in metrics:
+            tv = safe_mean([target.get(metric)])
+            bv = safe_mean([baseline.get(metric)])
+            row[f"{metric}_target"] = None if tv is None else round(float(tv), 6)
+            row[f"{metric}_baseline"] = None if bv is None else round(float(bv), 6)
+            row[f"{metric}_delta"] = None if tv is None or bv is None else round(float(tv - bv), 6)
+        out.append(row)
     return out
 
 # ============================================================
@@ -1986,7 +2461,7 @@ def main() -> None:
     ap.add_argument("--max-scenarios", type=int, default=None)
     ap.add_argument("--obs-ratio", type=float, default=DEFAULT_OBS_RATIO)
     ap.add_argument("--seed", type=int, default=2026)
-    ap.add_argument("--out-dir", type=str, default="outputs/comprehensive_v8_2_5")
+    ap.add_argument("--out-dir", type=str, default="outputs/comprehensive_v8_2_7")
     ap.add_argument("--api-mode", choices=["offline", "auto", "api"], default="auto", help="offline: no API; auto: call API only if key exists; api: require/call API")
     ap.add_argument("--llm-model", default="qwen3.6-flash", help="model for text/event/matrix LLM comparisons")
     ap.add_argument("--vlm-model", default="qwen3-vl-flash", help="model for raw image + VLM comparison")
@@ -2055,6 +2530,9 @@ def main() -> None:
 
     layer1_summary = aggregate_layer1(layer1_rows) if layer1_rows else []
     layer2_summary = aggregate_layer2(layer2_rows) if layer2_rows else []
+    layer2_family_summary = aggregate_layer2_by_family(layer2_rows) if layer2_rows else []
+    layer2_llm_advantage = aggregate_llm_advantage(layer2_summary) if layer2_summary else []
+    layer2_llm_advantage_by_family = aggregate_llm_advantage_by_family(layer2_family_summary) if layer2_family_summary else []
 
     run_config = {
         "version": COMPARISON_VERSION,
@@ -2085,10 +2563,15 @@ def main() -> None:
                 "scenario_id": s.scenario_id,
                 "accident_type": s.accident_type,
                 "challenge": s.challenge,
+                "hard_family": s.hard_family,
+                "diagnostic_goal": s.diagnostic_goal,
                 "llm_advantage": s.llm_advantage,
                 "expected_review": s.expected_review,
                 "ambiguous": s.ambiguous,
                 "unseen_combo": s.unseen_combo,
+                "expected_event_signatures": sorted(scenario_expected_signatures(s)),
+                "forbidden_predictions": list(s.forbidden_predictions),
+                "acceptable_predictions": list(s.acceptable_predictions),
                 "notes": s.notes,
             }
             for s in scenarios
@@ -2100,6 +2583,9 @@ def main() -> None:
         "run_config": run_config,
         "layer1_detection_summary": layer1_summary,
         "layer2_diagnosis_summary": layer2_summary,
+        "layer2_hard_family_summary": layer2_family_summary,
+        "layer2_llm_advantage_summary": layer2_llm_advantage,
+        "layer2_llm_advantage_by_family": layer2_llm_advantage_by_family,
         "layer1_rows": layer1_rows,
         "layer2_rows": layer2_rows,
     }
@@ -2111,6 +2597,9 @@ def main() -> None:
     save_csv(os.path.join(args.out_dir, "layer1_detection_summary.csv"), layer1_summary)
     save_csv(os.path.join(args.out_dir, "layer2_diagnosis_records.csv"), layer2_rows)
     save_csv(os.path.join(args.out_dir, "layer2_diagnosis_summary.csv"), layer2_summary)
+    save_csv(os.path.join(args.out_dir, "layer2_hard_family_summary.csv"), layer2_family_summary)
+    save_csv(os.path.join(args.out_dir, "layer2_llm_advantage_summary.csv"), layer2_llm_advantage)
+    save_csv(os.path.join(args.out_dir, "layer2_llm_advantage_by_family.csv"), layer2_llm_advantage_by_family)
 
     print(f"\n===== Comprehensive F2E/LLM/VLM Comparison {COMPARISON_VERSION} =====")
     print(f"core={CORE_VERSION} profile={args.profile} layers={layers} seeds={seeds} steps={steps} scenarios={len(scenarios)}")
@@ -2124,12 +2613,14 @@ def main() -> None:
     if layer2_summary:
         print("\nLayer 2 summary:")
         for r in layer2_summary:
-            print(f"  {r['method']}: acc={r.get('accident_classification_accuracy')} macroF1={r.get('macro_f1')} ambiguous={r.get('ambiguous_case_accuracy')} unseen={r.get('unseen_combination_accuracy')} tokens={r.get('mean_total_tokens')} api_tokens={r.get('mean_total_tokens_api_only')} api_usage={r.get('api_usage_rate')} e2e={metric_ms(r.get('mean_end_to_end_latency_ms'))} api_uncached={metric_ms(r.get('mean_measured_api_latency_ms'))}")
+            print(f"  {r['method']}: acc={r.get('accident_classification_accuracy')} macroF1={r.get('macro_f1')} reason={r.get('reasoning_alignment_score')} hard_reason={r.get('hard_reasoning_alignment_score')} ambiguous={r.get('ambiguous_case_accuracy')}/{r.get('ambiguous_reasoning_alignment_score')} unseen={r.get('unseen_combination_accuracy')}/{r.get('unseen_reasoning_alignment_score')} ood_reject={r.get('ood_template_rejection_success')} review={r.get('uncertainty_review_success')} tokens={r.get('mean_total_tokens')}")
     print("\nSaved:")
     for name in [
         "comprehensive_comparison_results.json", "run_config.json",
         "layer1_detection_records.csv", "layer1_detection_summary.csv",
         "layer2_diagnosis_records.csv", "layer2_diagnosis_summary.csv",
+        "layer2_hard_family_summary.csv",
+        "layer2_llm_advantage_summary.csv", "layer2_llm_advantage_by_family.csv",
     ]:
         print("  " + os.path.join(args.out_dir, name))
 
