@@ -47,6 +47,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import warnings
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -68,7 +69,7 @@ from University_Field_to_Event_Encoder import (
     nearest_free,
 )
 
-COMPARISON_VERSION = "v8.2.8-f2e-graph"
+COMPARISON_VERSION = "v8.3.0-f2e-graph-lc-weak-window"
 
 ACCIDENT_TYPES = [
     "fire",
@@ -1753,115 +1754,279 @@ def derive_f2e_diagnostic_features(events: List[Dict[str, Any]]) -> Dict[str, An
         "novel_combination_reasons": novel_reasons,
     }
 
-def derive_weak_candidates_from_fields(fields_by_t: List[Dict[str, np.ndarray]], free_mask: np.ndarray,
-                                       recent_frames: int = 45,
-                                       weak_z: float = 1.05,
-                                       min_weak_area: int = 3) -> Dict[str, Any]:
-    """Detect weak, coherent multi-field evidence from observed fields only.
+def _temporal_baseline_from_observations(fields_by_t: List[Dict[str, np.ndarray]],
+                                          field_key: str,
+                                          free_mask: np.ndarray,
+                                          baseline_frames: int = 24) -> np.ndarray:
+    """Observation-only temporal baseline for weak-candidate mining.
 
-    This is deliberately separated from confirmed F2E events. It is intended for
-    low-SNR diagnosis/review, not as a hard accident detector.
+    This is not a clean simulator background and does not use GT masks/labels.
+    It simply summarizes the earliest observed frames available to the diagnosis
+    adapter, analogous to a warm-up normal reference in a streaming deployment.
+    """
+    n0 = max(3, min(int(baseline_frames), max(3, len(fields_by_t) // 4), len(fields_by_t)))
+    stack_items = []
+    for frame in fields_by_t[:n0]:
+        if field_key in frame:
+            stack_items.append(np.asarray(frame[field_key], dtype=np.float32))
+    if not stack_items:
+        out = np.zeros_like(free_mask, dtype=np.float32)
+        out[~free_mask] = np.nan
+        return out
+    stack = np.array(stack_items, dtype=np.float32)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        base = np.nanmedian(stack, axis=0).astype(np.float32)
+    valid = free_mask & np.isfinite(base)
+    fill = float(np.nanmedian(base[valid])) if valid.any() else 0.0
+    base[free_mask & (~np.isfinite(base))] = fill
+    base[~free_mask] = np.nan
+    return base.astype(np.float32)
+
+
+def _robust_bias_correct_z(z: np.ndarray, free_mask: np.ndarray) -> np.ndarray:
+    valid = free_mask & np.isfinite(z)
+    if int(valid.sum()) < 25:
+        return z.astype(np.float32)
+    vals = z[valid]
+    cutoff = float(np.nanpercentile(np.abs(vals), 75.0))
+    stable = vals[np.abs(vals) <= max(0.35, cutoff)]
+    if stable.size < 12:
+        stable = vals
+    bias = float(np.nanmedian(stable))
+    if abs(bias) < 0.05:
+        return z.astype(np.float32)
+    bias = float(np.clip(bias, -0.85, 0.85))
+    out = z - bias
+    out[~free_mask] = np.nan
+    return out.astype(np.float32)
+
+
+def _confirmed_event_field_set(events: Optional[List[Dict[str, Any]]], polarity: str = "high") -> set:
+    out = set()
+    for ev in events or []:
+        if ev.get("polarity") == polarity and ev.get("field_key") in FIELDS:
+            out.add(str(ev.get("field_key")))
+    return out
+
+
+def _nearest_confirmed_event(candidate_centroid: List[float], confirmed_events: Optional[List[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(candidate_centroid, list) or len(candidate_centroid) < 2:
+        return None
+    c0 = np.array(candidate_centroid[:2], dtype=float)
+    best = None
+    best_dist = float("inf")
+    for ev in confirmed_events or []:
+        cent = ev.get("centroid")
+        if not isinstance(cent, (list, tuple)) or len(cent) < 2:
+            continue
+        try:
+            dist = float(np.linalg.norm(c0 - np.array(cent[:2], dtype=float)))
+        except Exception:
+            continue
+        if dist < best_dist:
+            best_dist = dist
+            best = {
+                "event_signature": event_signature(str(ev.get("field_key")), str(ev.get("polarity"))),
+                "field_key": ev.get("field_key"),
+                "polarity": ev.get("polarity"),
+                "distance": round(float(dist), 3),
+            }
+    return best
+
+
+def derive_weak_candidates_from_fields(fields_by_t: List[Dict[str, np.ndarray]], free_mask: np.ndarray,
+                                       recent_frames: int = 55,
+                                       baseline_frames: int = 24,
+                                       weak_floor_z: float = 0.55,
+                                       weak_peak_z: float = 0.95,
+                                       cumulative_threshold: float = 0.24,
+                                       min_persistence: float = 0.12,
+                                       min_weak_area: int = 3,
+                                       confirmed_events: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Mine recent-window cumulative weak evidence from observed fields only.
+
+    Weak candidates are sub-threshold, temporally persistent, observation-derived
+    evidence.  They are NOT confirmed F2E events and should not by themselves
+    create a hard accident label.  The goal is to expose low-SNR multi-field
+    patterns such as weak CO2/AQI support around a confirmed thermal event.
+
+    No simulator-only clean background, GT mask, scenario ID, accident label, or
+    injected-effect spec is used here.  The baseline is the earliest observed
+    frames in the same run, and the evidence is accumulated over the recent
+    diagnosis window.
     """
     if not fields_by_t:
-        return {"present": False, "candidate_events": [], "coherence_score": 0.0, "note": "no observed frames"}
-    recent = fields_by_t[-max(2, int(recent_frames)):]
+        return {
+            "present": False,
+            "candidate_events": [],
+            "coherence_score": 0.0,
+            "note": "no observed frames",
+            "weak_detector_version": "recent_window_cumulative_v1",
+        }
+
+    recent = fields_by_t[-max(3, int(recent_frames)):]
     rr, cc = np.indices(free_mask.shape)
     candidates: List[Dict[str, Any]] = []
+
+    confirmed_high_fields = _confirmed_event_field_set(confirmed_events, "high")
+    confirmed_sigs = sorted(event_signatures_from_events(confirmed_events or []))
+
     for field_key in FIELDS:
         if field_key not in recent[-1]:
             continue
         sem = FIELD_REGISTRY[field_key]
-        series_max_high: List[float] = []
-        series_max_low: List[float] = []
-        last_score_by_pol: Dict[str, np.ndarray] = {}
+        baseline = _temporal_baseline_from_observations(fields_by_t, field_key, free_mask, baseline_frames=baseline_frames)
+        scores_by_pol: Dict[str, List[np.ndarray]] = {"high": [], "low": []}
+
         for frame in recent:
             arr = np.asarray(frame[field_key], dtype=np.float32)
-            bg = estimate_spatial_bg(arr, free_mask)
-            z = (arr - bg) / (sem.sigma + 1e-6)
+            z = (arr - baseline) / (sem.sigma + 1e-6)
             z[~free_mask] = np.nan
-            high = np.maximum(z, 0.0)
-            low = np.maximum(-z, 0.0)
+            z = _robust_bias_correct_z(z, free_mask)
+            high = np.maximum(z, 0.0).astype(np.float32)
+            low = np.maximum(-z, 0.0).astype(np.float32)
             high[~np.isfinite(high)] = 0.0
             low[~np.isfinite(low)] = 0.0
-            series_max_high.append(float(np.nanmax(high[free_mask])) if np.any(free_mask) else 0.0)
-            series_max_low.append(float(np.nanmax(low[free_mask])) if np.any(free_mask) else 0.0)
-            last_score_by_pol = {"high": high, "low": low}
-        for polarity, ser in (("high", series_max_high), ("low", series_max_low)):
-            score = last_score_by_pol.get(polarity)
-            if score is None:
+            scores_by_pol["high"].append(high)
+            scores_by_pol["low"].append(low)
+
+        for polarity, score_list in scores_by_pol.items():
+            if not score_list:
                 continue
-            mask = free_mask & (score >= weak_z)
-            lab, n = label(mask, structure=np.ones((3, 3), dtype=np.uint8))
+            stack = np.stack(score_list, axis=0).astype(np.float32)
+            peak_map = np.nanmax(stack, axis=0)
+            mean_map = np.nanmean(stack, axis=0)
+            persistence_map = np.nanmean(stack >= float(weak_floor_z), axis=0)
+            # Cumulative weak evidence emphasizes persistent sub-threshold
+            # deviations instead of requiring the last frame to cross a weak z.
+            normalized = np.clip((stack - float(weak_floor_z)) / max(1e-6, float(weak_peak_z - weak_floor_z)), 0.0, 1.75)
+            cumulative_map = np.nanmean(normalized, axis=0)
+            evidence_map = (0.55 * cumulative_map + 0.25 * persistence_map + 0.20 * np.clip(peak_map / max(weak_peak_z, 1e-6), 0.0, 1.75)).astype(np.float32)
+            evidence_map[~free_mask] = 0.0
+            candidate_mask = free_mask & (peak_map >= float(weak_peak_z)) & (persistence_map >= float(min_persistence)) & (cumulative_map >= float(cumulative_threshold))
+            # Allow slightly lower persistence if a candidate is co-located with
+            # a strong confirmed event; this is useful for low-SNR companion
+            # fields around a thermal event.
+            if confirmed_events:
+                confirmed_mask_hint = np.zeros_like(candidate_mask, dtype=bool)
+                for ev in confirmed_events:
+                    cent = ev.get("centroid")
+                    if not isinstance(cent, (list, tuple)) or len(cent) < 2:
+                        continue
+                    try:
+                        d = np.sqrt((rr - float(cent[0])) ** 2 + (cc - float(cent[1])) ** 2)
+                    except Exception:
+                        continue
+                    confirmed_mask_hint |= d <= 4.5
+                candidate_mask |= free_mask & confirmed_mask_hint & (peak_map >= 0.85) & (persistence_map >= 0.08) & (cumulative_map >= max(0.18, float(cumulative_threshold) * 0.75))
+
+            lab, n = label(candidate_mask, structure=np.ones((3, 3), dtype=np.uint8))
             if n <= 0:
                 continue
-            # Keep only the largest weak component per field/polarity.
-            best_comp = None
-            best_sum = -1.0
+            comps = []
             for idx in range(1, n + 1):
                 comp = lab == idx
                 area = int(comp.sum())
-                if area < min_weak_area:
+                if area < int(min_weak_area):
                     continue
-                ssum = float(np.nansum(score[comp]))
-                if ssum > best_sum:
-                    best_sum = ssum
-                    best_comp = comp
-            if best_comp is None:
+                comp_score = float(np.nansum(evidence_map[comp]))
+                comps.append((comp_score, comp))
+            if not comps:
                 continue
-            vals = score[best_comp]
-            weights = vals + 1e-6
-            centroid = [round(float(np.average(rr[best_comp], weights=weights)), 3),
-                        round(float(np.average(cc[best_comp], weights=weights)), 3)]
-            xs = np.arange(len(ser), dtype=float)
-            ys = np.array(ser, dtype=float)
-            slope = 0.0
-            if len(xs) >= 3 and np.isfinite(ys).any():
-                denom = float(np.sum((xs - xs.mean()) ** 2))
-                if denom > 1e-9:
-                    slope = float(np.sum((xs - xs.mean()) * (ys - ys.mean())) / denom)
-            max_recent = float(np.nanmax(ys)) if ys.size else 0.0
-            if max_recent < weak_z:
-                continue
-            candidates.append({
-                "field_key": field_key,
-                "polarity": polarity,
-                "event_signature": event_signature(field_key, polarity),
-                "centroid": centroid,
-                "area": int(best_comp.sum()),
-                "max_recent_z": round(float(max_recent), 3),
-                "last_component_mean_z": round(float(np.nanmean(vals)), 3),
-                "trend": "strengthening" if slope > 0.006 else ("weakening" if slope < -0.006 else "stable"),
-                "score_sum": round(float(best_sum), 3),
-            })
+            comps.sort(key=lambda x: x[0], reverse=True)
+            # Keep up to two weak regions per field/polarity to preserve
+            # possible multi-region evidence without bloating the prompt.
+            for comp_score, comp in comps[:2]:
+                vals = evidence_map[comp]
+                weights = vals + 1e-6
+                centroid = [round(float(np.average(rr[comp], weights=weights)), 3),
+                            round(float(np.average(cc[comp], weights=weights)), 3)]
+                # Temporal trend from the spatial component mean score.
+                series = np.array([float(np.nanmean(s[comp])) for s in stack], dtype=float)
+                xs = np.arange(len(series), dtype=float)
+                slope = 0.0
+                if len(xs) >= 3 and np.isfinite(series).any():
+                    denom = float(np.sum((xs - xs.mean()) ** 2))
+                    if denom > 1e-9:
+                        slope = float(np.sum((xs - xs.mean()) * (series - series.mean())) / denom)
+                nearest_confirmed = _nearest_confirmed_event(centroid, confirmed_events)
+                co_located = bool(nearest_confirmed and float(nearest_confirmed.get("distance", 999.0)) <= 4.5)
+                candidates.append({
+                    "field_key": field_key,
+                    "polarity": polarity,
+                    "candidate_type": "weak_candidate_event",
+                    "event_signature": event_signature(field_key, polarity),
+                    "centroid": centroid,
+                    "area": int(comp.sum()),
+                    "recent_window_cumulative_score": round(float(np.nanmean(cumulative_map[comp])), 3),
+                    "temporal_persistence": round(float(np.nanmean(persistence_map[comp])), 3),
+                    "peak_recent_z": round(float(np.nanmax(peak_map[comp])), 3),
+                    "mean_recent_z": round(float(np.nanmean(mean_map[comp])), 3),
+                    "evidence_score": round(float(np.nanmean(vals)), 3),
+                    "trend": "strengthening" if slope > 0.004 else ("weakening" if slope < -0.004 else "stable"),
+                    "co_located_with_confirmed_event": co_located,
+                    "nearest_confirmed_event": nearest_confirmed,
+                    "score_sum": round(float(comp_score), 3),
+                })
 
-    # Multi-field weak coherence: at least two high weak candidates, roughly co-located.
+    # Sort and deduplicate lightly. Confirmed events may already contain a field;
+    # keep the weak candidate because it can still provide window statistics, but
+    # the LLM is told it is not a confirmed event.
+    candidates.sort(key=lambda c: float(c.get("evidence_score", 0.0) or 0.0), reverse=True)
+    candidates = candidates[:12]
+
     coherent_pairs = []
-    for i, a in enumerate(candidates):
+    evidence_nodes = candidates + [
+        {"event_signature": s, "field_key": s.split(":", 1)[0], "polarity": s.split(":", 1)[1], "centroid": None, "source": "confirmed_event"}
+        for s in confirmed_sigs
+    ]
+    for i, a in enumerate(evidence_nodes):
         ca = a.get("centroid")
-        if not isinstance(ca, list):
-            continue
-        for b in candidates[i + 1:]:
-            cb = b.get("centroid")
-            if not isinstance(cb, list):
-                continue
+        for b in evidence_nodes[i + 1:]:
             if a.get("polarity") != b.get("polarity"):
                 continue
+            # Confirmed events without centroids still contribute field-set
+            # evidence, but not spatial-pair evidence.
+            cb = b.get("centroid")
+            if not isinstance(ca, list) or not isinstance(cb, list):
+                continue
             dist = float(np.linalg.norm(np.array(ca, dtype=float) - np.array(cb, dtype=float)))
-            if dist <= 4.0:
+            if dist <= 4.5:
                 coherent_pairs.append({"a": a.get("event_signature"), "b": b.get("event_signature"), "distance": round(dist, 3)})
-    high_fields = sorted({c["field_key"] for c in candidates if c.get("polarity") == "high" and c.get("max_recent_z", 0) >= weak_z})
-    target_low_snr_pattern = {"temperature", "co2", "air_quality"}.issubset(set(high_fields))
+
+    high_weak_fields = sorted({c["field_key"] for c in candidates if c.get("polarity") == "high" and float(c.get("peak_recent_z", 0.0) or 0.0) >= 0.85})
+    combined_high_fields = sorted(set(high_weak_fields) | set(confirmed_high_fields))
+    target_low_snr_pattern = {"temperature", "co2", "air_quality"}.issubset(set(combined_high_fields))
+
+    colocated_weak_count = sum(1 for c in candidates if c.get("co_located_with_confirmed_event"))
+    avg_evidence = safe_mean([c.get("evidence_score") for c in candidates]) or 0.0
+    avg_persistence = safe_mean([c.get("temporal_persistence") for c in candidates]) or 0.0
     coherence_score = 0.0
-    if candidates:
-        coherence_score = min(1.0, 0.20 * len(candidates) + 0.18 * len(coherent_pairs) + (0.25 if target_low_snr_pattern else 0.0))
+    if candidates or confirmed_high_fields:
+        coherence_score = min(
+            1.0,
+            0.18 * len(high_weak_fields)
+            + 0.12 * len(coherent_pairs)
+            + 0.10 * colocated_weak_count
+            + 0.18 * float(avg_evidence)
+            + 0.12 * float(avg_persistence)
+            + (0.28 if target_low_snr_pattern else 0.0),
+        )
+
     return {
-        "present": bool(target_low_snr_pattern or (len(coherent_pairs) >= 2 and len(high_fields) >= 2)),
+        "present": bool(target_low_snr_pattern and coherence_score >= 0.50),
         "candidate_events": candidates,
         "coherent_pairs": coherent_pairs,
-        "high_weak_fields": high_fields,
+        "high_weak_fields": high_weak_fields,
+        "confirmed_high_fields": sorted(confirmed_high_fields),
+        "combined_high_fields": combined_high_fields,
         "target_low_snr_pattern_hint": bool(target_low_snr_pattern),
         "coherence_score": round(float(coherence_score), 3),
-        "note": "Weak candidates are observation-derived and are not confirmed F2E events.",
+        "recent_frames": int(len(recent)),
+        "baseline_frames": int(max(3, min(int(baseline_frames), max(3, len(fields_by_t) // 4), len(fields_by_t)))),
+        "weak_detector_version": "recent_window_cumulative_v1",
+        "note": "Weak candidates are recent-window cumulative, observation-derived, and are not confirmed F2E events.",
     }
 
 def graph_guided_offline_diag(payload: Dict[str, Any], mode: str) -> Optional[Dict[str, Any]]:
@@ -1869,6 +2034,24 @@ def graph_guided_offline_diag(payload: Dict[str, Any], mode: str) -> Optional[Di
     derived = payload.get("derived_f2e_features") or {}
     weak = payload.get("weak_multifield_evidence") or {}
     sigs = set(derived.get("event_signatures") or event_signatures_from_events(payload.get("events") or []))
+    oq = payload.get("observation_quality") or {}
+    if bool(oq.get("low_confidence")) or float(oq.get("last_frame_missing_fraction", 0.0) or 0.0) >= 0.30 or float(oq.get("max_missing_fraction", 0.0) or 0.0) >= 0.30:
+        target_field = None
+        for preferred in ("humidity", "temperature", "air_quality", "co2", "pressure"):
+            if any(s.startswith(preferred + ":") for s in sigs):
+                target_field = preferred
+                break
+        return {
+            "accident_type": "needs_review_unknown",
+            "confidence": 0.42,
+            "review_needed": True,
+            "abnormal_confirmed": False,
+            "resample_target": {"field_key": target_field, "centroid": None} if target_field else None,
+            "evidence_fields": sorted({s.split(":", 1)[0] for s in sigs}),
+            "evidence_events": [{"field_key": s.split(":", 1)[0], "polarity": s.split(":", 1)[1], "role": "low_confidence_evidence"} for s in sorted(sigs)],
+            "template_status": "insufficient_data",
+            "explanation": "Offline graph-guided F2E adapter: observation quality is low/heavily missing, so review is required before a hard accident label.",
+        }
     if derived.get("composite_candidate"):
         return {
             "accident_type": "composite_anomaly",
@@ -1988,6 +2171,10 @@ def build_f2e_diagnosis_prompt(input_kind: str, scenario_payload: Dict[str, Any]
             "These are computed only from observation-derived F2E events/fields, not from labels. "
             "Use spatial_clusters, event_signatures, composite_candidate, novel_combination_candidate, "
             "and weak_multifield_evidence as decision aids. "
+            "The weak_multifield_evidence object is produced by a recent-window cumulative weak-evidence detector; "
+            "candidate_events are sub-threshold candidates, not confirmed F2E events. "
+            "Pay attention to recent_window_cumulative_score, temporal_persistence, peak_recent_z, "
+            "combined_high_fields, target_low_snr_pattern_hint, and co_located_with_confirmed_event. "
         )
     system = (
         "You are an industrial multi-physics accident diagnosis module specialized for F2E_structured_event_tokens. "
@@ -2002,6 +2189,15 @@ def build_f2e_diagnosis_prompt(input_kind: str, scenario_payload: Dict[str, Any]
         "\"explanation\": str}. "
         "Use only the provided observation representation. Do not assume hidden labels, scenario IDs, injected specs, or ground truth. "
         + graph_text +
+        "LOW-CONFIDENCE HARD OVERRIDE FOR F2E: before template matching, inspect payload.observation_quality. "
+        "If observation_quality.low_confidence is true, or last_frame_missing_fraction >= 0.30, or max_missing_fraction >= 0.30, "
+        "the default and strongly preferred accident_type is needs_review_unknown with review_needed=true, abnormal_confirmed=false, "
+        "template_status=insufficient_data, and confidence <= 0.45. "
+        "This low-confidence override has higher priority than known-template matching and higher priority than a single strong F2E event cluster. "
+        "Even if F2E events look like fire, water_leak, steam_leak, co2_accumulation, dust_pollution, electrical_overheat, or composite_anomaly, "
+        "do not output a hard accident label when heavy missingness/low confidence makes the observation unreliable; instead request review/resampling. "
+        "Only bypass this override if the payload explicitly shows observation quality is good and the low-confidence fields are not among the evidence fields. "
+        "When using the override, choose resample_target from the most diagnostic observed event field, preferably humidity for leak-like evidence, temperature/AQI/CO2 for fire-like evidence, pressure for pressure/process contradictions. "
         "F2E events are not raw pixels; they are physical event tokens with field_key, polarity, morphology, centroid, strength, physical_tag, and temporal_summary. "
         "Do not classify from a single dominant event before checking the full event set. "
         "First group events by centroid into local incident clusters. Events within about 3 grid cells are co-located; events separated by about 5 or more grid cells should normally be treated as distinct physical clusters. "
@@ -2015,8 +2211,8 @@ def build_f2e_diagnosis_prompt(input_kind: str, scenario_payload: Dict[str, Any]
         "In particular, a fire-like cluster plus a spatially separated humidity/leak-like cluster must not be collapsed to fire merely because the fire-like cluster is strong. "
         "Novel-combination override: if a known template leaves a strong additional event unexplained and that event changes the physical interpretation, choose needs_review_unknown with template_status=novel_combination and review_needed=true. "
         "Examples: co2:high+pressure:high, temperature:high+pressure:low, or pressure:high+air_quality:high+humidity:low are not ordinary known templates. "
-        "Low-SNR rule: choose low_snr_anomaly only when weak but coherent multi-field evidence is present; otherwise choose needs_review_unknown for insufficient data. "
-        "If observation_quality indicates heavy missingness/low confidence, set review_needed=true and provide a resample_target on the most diagnostic field. "
+        "Low-SNR rule: choose low_snr_anomaly when weak_multifield_evidence.present is true or when weak_multifield_evidence shows target_low_snr_pattern_hint=true with combined_high_fields containing temperature, co2, and air_quality, especially if weak candidates are temporally persistent or co-located with a confirmed event. Do not collapse confirmed temperature:high plus weak CO2/AQI support into electrical_overheat. If only isolated temperature evidence is present and weak_multifield_evidence is absent, electrical_overheat may be appropriate. "
+        "If observation_quality indicates heavy missingness/low confidence, the hard override above applies: choose needs_review_unknown, set review_needed=true, and provide a resample_target on the most diagnostic field. "
         "In evidence_events, list every observation-derived field/polarity that materially supports the decision. "
         "In the explanation, explicitly mention clusters, fields, polarities, trends, and why the final label was not a simpler known template."
     )
@@ -2387,7 +2583,7 @@ def build_method_inputs(trace_threshold: RunTrace, trace_f2e: RunTrace, image_di
     matrix_t0 = time.perf_counter()
     matrix_summary = current_field_summary(fields_for_diagnosis, trace_f2e.grid == 0)
     obs_quality = observation_quality(fields_for_diagnosis, trace_f2e.grid == 0)
-    weak_multifield_evidence = derive_weak_candidates_from_fields(fields_for_diagnosis, trace_f2e.grid == 0)
+    weak_multifield_evidence = derive_weak_candidates_from_fields(fields_for_diagnosis, trace_f2e.grid == 0, confirmed_events=f2e_events)
     f2e_derived_features = derive_f2e_diagnostic_features(f2e_events)
     matrix_summary["observation_quality"] = obs_quality
     matrix_summary["weak_multifield_evidence"] = weak_multifield_evidence
