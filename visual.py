@@ -1,4 +1,5 @@
 from math import pi
+import os
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -11,96 +12,155 @@ plt.rcParams.update({
 })
 
 metrics = {
-    "Detection Rate": 0.9889,
-    "Pass Basic Rate": 0.9889,
-    "Mean IoU": 0.9712,
-    "Shape Match": 0.8652,
-    "Area Trend": 0.9663,
-    "Intensity Trend": 0.8876,
+    "Detection \n Precision": 0.959,
+    "Detection \n Recall": 0.955,
+    "Detection \n F1": 0.957,
+    "Mean \n IoU": 0.931,
+    "Shape \n Accuracy": 0.854,
+    "Trend \n Accuracy": 0.850,
 }
 
 labels = list(metrics.keys())
 values = list(metrics.values())
 
-# 闭合雷达图
+# ======================
+# 雷达图角度
+# ======================
 N = len(labels)
 angles = np.linspace(0, 2 * np.pi, N, endpoint=False).tolist()
 
-values += values[:1]
-angles += angles[:1]
+# 闭合雷达图
+values_closed = values + values[:1]
+angles_closed = angles + angles[:1]
 
 # ======================
 # 绘图
 # ======================
-# 稍微增大画布，为外围标签留出更充足的空间
-fig = plt.figure(figsize=(10, 10))
+fig = plt.figure(figsize=(10, 12))
 ax = plt.subplot(111, polar=True)
 
-# 曲线（加入了 marker 以高亮具体的数据点）
+# 曲线
 ax.plot(
-    angles,
-    values,
+    angles_closed,
+    values_closed,
     linewidth=3,
     linestyle='solid',
-    marker='o',         # 数据点标记
+    marker='o',
     markersize=8
 )
 
 # 填充
 ax.fill(
-    angles,
-    values,
+    angles_closed,
+    values_closed,
     alpha=0.25
 )
 
-# 标签
-ax.set_xticks(angles[:-1])
-ax.set_xticklabels(
-    labels,
-    fontsize=16,
-    fontweight='bold'
-)
+# ======================
+# 分类标签：手动放置，避免遮挡
+# ======================
+ax.set_xticks(angles)
+ax.set_xticklabels([])  # 关闭默认标签，改为手动绘制
 
-# 【关键修改 1】：增加分类标签与雷达图边缘的距离，防止与数据/数值遮挡
-ax.tick_params(axis='x', pad=30)
+label_radius = 1.12  # 标签距离圆心的半径，越大越靠外
 
-# 【关键修改 2】：循环添加数值文本
-for i in range(N):
-    # 将数值位置向内侧收缩 0.08，并加入带透明度的背景框防止网格线干扰阅读
+for angle, label in zip(angles, labels):
+    x = np.cos(angle)
+    y = np.sin(angle)
+
+    # 根据左右位置设置水平对齐
+    if x > 0.5:
+        ha = 'left'      # 右侧标签向右展开
+    elif x < -0.5:
+        ha = 'right'     # 左侧标签向左展开
+    else:
+        ha = 'center'
+
+    # 根据上下位置设置垂直对齐
+    if y > 0.5:
+        va = 'bottom'
+    elif y < -0.5:
+        va = 'top'
+    else:
+        va = 'center'
+
     ax.text(
-        angles[i], 
-        values[i] - 0.08, 
-        f"{values[i]:.4f}", 
-        ha='center', 
-        va='center', 
-        fontsize=12, 
-        fontweight='bold', 
-        color='black',
-        bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', boxstyle='round,pad=0.3')
+        angle,
+        label_radius,
+        label,
+        ha=ha,
+        va=va,
+        fontsize=25,
+        fontweight='bold',
+        clip_on=False
     )
 
-# 径向刻度
+# ======================
+# 数值文本
+# ======================
+for i in range(N):
+    # 默认数值向内收缩
+    r = values[i] - 0.08
+
+    # 最右侧 Detection Precision 特别容易和标签重叠，进一步向内移动
+    if i == 0:
+        r = values[i] - 0.17
+
+    ax.text(
+        angles[i],
+        r,
+        f"{values[i]:.3f}",
+        ha='center',
+        va='center',
+        fontsize=25,
+        fontweight='bold',
+        color='black',
+        bbox=dict(
+            facecolor='white',
+            alpha=0.7,
+            edgecolor='none',
+            boxstyle='round,pad=0.3'
+        )
+    )
+
+# ======================
+# 径向刻度设置
+# ======================
 ax.set_rlabel_position(0)
 ax.tick_params(
     axis='y',
     labelsize=14
 )
 
-# 标题
-ax.set_title(
-    "Encoder Performance",
-    fontsize=22,
-    fontweight='bold',
-    pad=40
-)
+# 隐藏 y 轴刻度标签
+ax.set_yticklabels([])
 
-# 网格线稍粗
+# 网格线
 ax.grid(linewidth=1.2)
 
 # 范围
 ax.set_ylim(0, 1.0)
 
-plt.tight_layout()
+# 标题
+ax.set_title(
+    "Encoder Performance",
+    fontsize=35,
+    fontweight='bold',
+    pad=60
+)
+
+# ======================
+# 布局与保存
+# ======================
+# 手动留白，比 tight_layout 更适合极坐标外部标签
+plt.subplots_adjust(
+    left=0.15,
+    right=0.85,
+    top=0.82,
+    bottom=0.12
+)
+
+os.makedirs("outputs", exist_ok=True)
 
 plt.savefig(
     "outputs/encoder_performance_radar.png",

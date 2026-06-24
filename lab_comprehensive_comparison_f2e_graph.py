@@ -69,7 +69,7 @@ from University_Field_to_Event_Encoder import (
     nearest_free,
 )
 
-COMPARISON_VERSION = "v8.3.0-f2e-graph-lc-weak-window"
+COMPARISON_VERSION = "v8.3.1-f2e-graph-lc-weak-window-neutral"
 
 ACCIDENT_TYPES = [
     "fire",
@@ -1997,7 +1997,7 @@ def derive_weak_candidates_from_fields(fields_by_t: List[Dict[str, np.ndarray]],
 
     high_weak_fields = sorted({c["field_key"] for c in candidates if c.get("polarity") == "high" and float(c.get("peak_recent_z", 0.0) or 0.0) >= 0.85})
     combined_high_fields = sorted(set(high_weak_fields) | set(confirmed_high_fields))
-    target_low_snr_pattern = {"temperature", "co2", "air_quality"}.issubset(set(combined_high_fields))
+    weak_multifield_coherence_pattern = {"temperature", "co2", "air_quality"}.issubset(set(combined_high_fields))
 
     colocated_weak_count = sum(1 for c in candidates if c.get("co_located_with_confirmed_event"))
     avg_evidence = safe_mean([c.get("evidence_score") for c in candidates]) or 0.0
@@ -2011,17 +2011,17 @@ def derive_weak_candidates_from_fields(fields_by_t: List[Dict[str, np.ndarray]],
             + 0.10 * colocated_weak_count
             + 0.18 * float(avg_evidence)
             + 0.12 * float(avg_persistence)
-            + (0.28 if target_low_snr_pattern else 0.0),
+            + (0.28 if weak_multifield_coherence_pattern else 0.0),
         )
 
     return {
-        "present": bool(target_low_snr_pattern and coherence_score >= 0.50),
+        "present": bool(weak_multifield_coherence_pattern and coherence_score >= 0.50),
         "candidate_events": candidates,
         "coherent_pairs": coherent_pairs,
         "high_weak_fields": high_weak_fields,
         "confirmed_high_fields": sorted(confirmed_high_fields),
         "combined_high_fields": combined_high_fields,
-        "target_low_snr_pattern_hint": bool(target_low_snr_pattern),
+        "weak_multifield_coherence_hint": bool(weak_multifield_coherence_pattern),
         "coherence_score": round(float(coherence_score), 3),
         "recent_frames": int(len(recent)),
         "baseline_frames": int(max(3, min(int(baseline_frames), max(3, len(fields_by_t) // 4), len(fields_by_t)))),
@@ -2174,7 +2174,7 @@ def build_f2e_diagnosis_prompt(input_kind: str, scenario_payload: Dict[str, Any]
             "The weak_multifield_evidence object is produced by a recent-window cumulative weak-evidence detector; "
             "candidate_events are sub-threshold candidates, not confirmed F2E events. "
             "Pay attention to recent_window_cumulative_score, temporal_persistence, peak_recent_z, "
-            "combined_high_fields, target_low_snr_pattern_hint, and co_located_with_confirmed_event. "
+            "combined_high_fields, weak_multifield_coherence_hint, and co_located_with_confirmed_event. "
         )
     system = (
         "You are an industrial multi-physics accident diagnosis module specialized for F2E_structured_event_tokens. "
@@ -2211,7 +2211,7 @@ def build_f2e_diagnosis_prompt(input_kind: str, scenario_payload: Dict[str, Any]
         "In particular, a fire-like cluster plus a spatially separated humidity/leak-like cluster must not be collapsed to fire merely because the fire-like cluster is strong. "
         "Novel-combination override: if a known template leaves a strong additional event unexplained and that event changes the physical interpretation, choose needs_review_unknown with template_status=novel_combination and review_needed=true. "
         "Examples: co2:high+pressure:high, temperature:high+pressure:low, or pressure:high+air_quality:high+humidity:low are not ordinary known templates. "
-        "Low-SNR rule: choose low_snr_anomaly when weak_multifield_evidence.present is true or when weak_multifield_evidence shows target_low_snr_pattern_hint=true with combined_high_fields containing temperature, co2, and air_quality, especially if weak candidates are temporally persistent or co-located with a confirmed event. Do not collapse confirmed temperature:high plus weak CO2/AQI support into electrical_overheat. If only isolated temperature evidence is present and weak_multifield_evidence is absent, electrical_overheat may be appropriate. "
+        "Low-SNR rule: choose low_snr_anomaly when weak_multifield_evidence.present is true or when weak_multifield_evidence shows weak_multifield_coherence_hint=true with combined_high_fields containing temperature, co2, and air_quality, especially if weak candidates are temporally persistent or co-located with a confirmed event. This hint is an observation-derived weak-evidence coherence flag, not a ground-truth label. Do not collapse confirmed temperature:high plus weak CO2/AQI support into electrical_overheat. If only isolated temperature evidence is present and weak_multifield_evidence is absent, electrical_overheat may be appropriate. "
         "If observation_quality indicates heavy missingness/low confidence, the hard override above applies: choose needs_review_unknown, set review_needed=true, and provide a resample_target on the most diagnostic field. "
         "In evidence_events, list every observation-derived field/polarity that materially supports the decision. "
         "In the explanation, explicitly mention clusters, fields, polarities, trends, and why the final label was not a simpler known template."
