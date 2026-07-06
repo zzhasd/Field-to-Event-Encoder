@@ -12,6 +12,27 @@ SUMMARY_CSV = os.path.join(OUT_DIR, "layer2_diagnosis_summary.csv")
 FIG_DIR = os.path.join(OUT_DIR, "figures")
 os.makedirs(FIG_DIR, exist_ok=True)
 
+# =========================
+# Font config for paper figure
+# =========================
+AXIS_LABEL_FONTSIZE = 20
+TICK_LABEL_FONTSIZE = 15
+BAR_LABEL_FONTSIZE = 15
+LEGEND_FONTSIZE = 20
+
+# Horizontal layout config
+# Increase FIG_WIDTH and X_GAP_SCALE if x-axis labels still overlap.
+FIG_WIDTH = 19.5
+FIG_HEIGHT = 6.8
+X_GAP_SCALE = 1.35
+
+
+def set_tick_labels_bold(ax):
+    """Make tick labels larger and bold without changing axis data or layout logic."""
+    ax.tick_params(axis="both", labelsize=TICK_LABEL_FONTSIZE)
+    for label in ax.get_xticklabels() + ax.get_yticklabels():
+        label.set_fontweight("bold")
+
 def safe_output_path(path):
     """
     Return a writable output path.
@@ -56,9 +77,9 @@ method_order = [
 method_labels = {
     "f2e_events_graph_llm": "F2E graph + LLM",
     "f2e_events_llm_f2e_prompt": "F2E + LLM",
-    "threshold_events_llm": "Threshold events + LLM",
+    "threshold_events_llm": "Threshold + LLM",
     "raw_matrix_summary_llm": "Raw matrix + LLM",
-    "threshold_events_rules": "Threshold events + rules",
+    "threshold_events_rules": "Threshold + rules",
     "f2e_events_rules": "F2E + rules",
     "raw_field_image_vlm": "Raw field image + VLM",
 }
@@ -148,15 +169,15 @@ else:
 # =========================
 # Plot diagnosis metrics + token consumption with dual y-axes
 # =========================
-fig, ax1 = plt.subplots(figsize=(16.0, 6.8))
+fig, ax1 = plt.subplots(figsize=(FIG_WIDTH, FIG_HEIGHT))
 
-x = np.arange(len(plot_df))
+x = np.arange(len(plot_df)) * X_GAP_SCALE
 
 # If tokens are available, draw five bars per method:
 #   4 score bars on the left y-axis + 1 token bar on the right y-axis.
 # If tokens are not available, keep the original four-bar layout.
 num_bar_groups = len(metrics) + (1 if has_token_metric else 0)
-bar_width = 0.15 if has_token_metric else 0.18
+bar_width = 0.15 if has_token_metric else 0.17
 
 for i, metric in enumerate(metrics):
     offset = (i - (num_bar_groups - 1) / 2) * bar_width
@@ -173,7 +194,8 @@ for i, metric in enumerate(metrics):
         bars,
         labels=[f"{v:.1f}" for v in plot_df[metric]],
         padding=2,
-        fontsize=10,
+        fontsize=BAR_LABEL_FONTSIZE,
+        fontweight="bold",
         rotation=90,
     )
 
@@ -182,11 +204,15 @@ ax1.set_xticklabels(
     [method_labels[m] for m in plot_df["method"].astype(str)],
     rotation=0,
     ha="center",
+    fontsize=TICK_LABEL_FONTSIZE,
+    fontweight="bold",
 )
 
-ax1.set_ylabel("Score (%)")
+ax1.set_ylabel("Score (%)", fontsize=AXIS_LABEL_FONTSIZE, fontweight="bold")
 ax1.set_ylim(0, 118)
+ax1.margins(x=0.04)
 ax1.grid(axis="y", linestyle="--", alpha=0.35)
+set_tick_labels_bold(ax1)
 
 # Secondary y-axis for token consumption.
 if has_token_metric:
@@ -196,21 +222,48 @@ if has_token_metric:
 
     token_offset = (len(metrics) - (num_bar_groups - 1) / 2) * bar_width
 
+    token_color = "#1f77b4"
+
     token_bars = ax2.bar(
         x + token_offset,
         token_values,
         width=bar_width,
         label="Tokens",
+        color=token_color,
+        edgecolor=token_color,
         alpha=0.35,
         hatch="//",
     )
 
-    ax2.set_ylabel("Tokens")
+    ax2.set_ylabel(
+        "Tokens",
+        fontsize=AXIS_LABEL_FONTSIZE,
+        fontweight="bold",
+        color=token_color,
+    )
+
+    # 右侧 y 轴刻度字体：放大、加粗、改色
+    ax2.tick_params(
+        axis="y",
+        labelsize=TICK_LABEL_FONTSIZE,
+        colors=token_color,
+        width=2.0,
+        length=6,
+    )
+
+    for label in ax2.get_yticklabels():
+        label.set_fontweight("bold")
+
+    # 右侧 y 轴轴线：加粗、改色
+    ax2.spines["right"].set_color(token_color)
+    ax2.spines["right"].set_linewidth(2.0)
 
     # Add headroom so token labels do not touch the top border.
     token_max = np.nanmax(token_values)
     if np.isfinite(token_max) and token_max > 0:
         ax2.set_ylim(0, token_max * 1.18)
+
+    set_tick_labels_bold(ax2)
 
     # Add numeric token labels.
     token_labels = []
@@ -225,7 +278,9 @@ if has_token_metric:
         token_bars,
         labels=token_labels,
         padding=2,
-        fontsize=10,
+        fontsize=BAR_LABEL_FONTSIZE,
+        fontweight="bold",
+        color=token_color,
         rotation=90,
     )
 
@@ -238,28 +293,45 @@ else:
     legend_handles, legend_labels = ax1.get_legend_handles_labels()
     legend_ncol = 4
 
-ax1.set_title(
-    "Layer 2 diagnosis performance and token consumption\n"
-    "Acc, MacroF1, hard reasoning, OOD rejection, and tokens across all methods."
-)
+# ax1.set_title(
+#     "Layer 2 diagnosis performance and token consumption\n"
+#     "Acc, MacroF1, hard reasoning, OOD rejection, and tokens across all methods."
+# )
 
 ax1.legend(
     legend_handles,
     legend_labels,
     ncol=legend_ncol,
-    loc="upper center",
-    bbox_to_anchor=(0.5, 1.16),
+    loc="lower center",
+    prop={"size": LEGEND_FONTSIZE, "weight": "bold"},
+    bbox_to_anchor=(0.5, 1.005),
+    borderaxespad=0.0,
+    borderpad=0.0,
+    handletextpad=0.5,
+    columnspacing=1.0,
+    labelspacing=0.1,
     frameon=False,
 )
 
+plt.tight_layout(pad=0.15)
 plt.tight_layout()
 
 # Save performance figure
 png_path = safe_output_path(os.path.join(FIG_DIR, "layer2_diagnosis_performance_all_methods_labeled_token_bar.png"))
 pdf_path = safe_output_path(os.path.join(FIG_DIR, "layer2_diagnosis_performance_all_methods_labeled_token_bar.pdf"))
 
-plt.savefig(png_path, dpi=300, bbox_inches="tight")
-plt.savefig(pdf_path, bbox_inches="tight")
+plt.savefig(
+    png_path,
+    dpi=300,
+    bbox_inches="tight",
+    pad_inches=0.01
+)
+
+plt.savefig(
+    pdf_path,
+    bbox_inches="tight",
+    pad_inches=0.01
+)
 plt.close()
 
 print(f"Saved performance PNG to: {png_path}")
