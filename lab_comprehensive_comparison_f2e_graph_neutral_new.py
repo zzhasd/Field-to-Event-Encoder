@@ -1,6 +1,6 @@
 """Comprehensive comparison experiments for Field-to-Event (F2E) + LLM systems.
 
-Version: v8.5.3 conventional threshold-alarm matrix baseline
+Version: v8.8.0 parameter-free adaptive evidence graph with audit-only protocol checks
 
 This script is intentionally an experiment/evaluation layer only.  It imports the
 core no-leak F2E encoder from University_Field_to_Event_Encoder.py and never
@@ -46,7 +46,7 @@ import urllib.request
 import warnings
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.ndimage import binary_dilation, gaussian_filter, label
@@ -66,7 +66,7 @@ from University_Field_to_Event_Encoder import (
     nearest_free,
 )
 
-COMPARISON_VERSION = "v8.5.3-conventional-threshold-matrix-f2e-neutral-parallel"
+COMPARISON_VERSION = "v8.8.0-parameter-free-adaptive-evidence-graph-audit-only-parallel"
 
 ACCIDENT_TYPES = [
     "fire",
@@ -712,7 +712,6 @@ def summarize_events(events: List[Dict[str, Any]], max_events: int = 10,
             "duration_steps": tmp.get("duration_steps"),
             "area_trend": tmp.get("area_trend"),
             "intensity_trend": tmp.get("intensity_trend"),
-            "physical_tag": (ev.get("physical_tag") or {}).get("label"),
         }
         duration = tmp.get("duration_steps")
         if duration is not None and history_frames is not None and int(history_frames) > 0:
@@ -1818,16 +1817,6 @@ def _centroid_or_none(ev: Dict[str, Any]) -> Optional[Tuple[float, float]]:
             return None
     return None
 
-def _event_strength_value(ev: Dict[str, Any]) -> float:
-    for key in ("z_core_mean", "score_sum", "priority"):
-        try:
-            val = float(ev.get(key))
-            if np.isfinite(val):
-                return val
-        except Exception:
-            pass
-    return 0.0
-
 def event_signatures_from_events(events: List[Dict[str, Any]]) -> List[str]:
     sigs = []
     for ev in events:
@@ -1903,247 +1892,24 @@ class ObstacleAwareGeodesic:
         return None if not np.isfinite(value) else value
 
 
-def prepare_event_graph_nodes(events: List[Dict[str, Any]], grid: np.ndarray,
-                              history_frames: Optional[int] = None) -> List[Dict[str, Any]]:
-    nodes: List[Dict[str, Any]] = []
-    for index, event in enumerate(events):
-        centroid = _centroid_or_none(event)
-        if centroid is None:
-            continue
-        anchor = snap_centroid_to_free(grid, centroid, event.get("mask"))
-        summary = summarize_events([event], max_events=1, history_frames=history_frames)[0]
-        nodes.append({
-            "index": int(index),
-            "node_id": f"E{len(nodes) + 1}",
-            "event": event,
-            "centroid": [float(centroid[0]), float(centroid[1])],
-            "anchor": anchor,
-            "summary": summary,
-        })
-    return nodes
-
-
-def _event_graph_distance(node_a: Dict[str, Any], node_b: Dict[str, Any], distance_mode: str,
-                          geodesic: ObstacleAwareGeodesic) -> Optional[float]:
-    if distance_mode == "euclidean":
-        return float(np.linalg.norm(np.asarray(node_a["centroid"]) - np.asarray(node_b["centroid"])))
-    return geodesic.distance(node_a["anchor"], node_b["anchor"])
-
-
-def single_link_event_clusters(nodes: List[Dict[str, Any]], distance_fn: Callable[[Dict[str, Any], Dict[str, Any]], Optional[float]],
-                               merge_distance: float) -> List[List[Dict[str, Any]]]:
-    parent = list(range(len(nodes)))
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-    for i, node_a in enumerate(nodes):
-        for j in range(i + 1, len(nodes)):
-            distance = distance_fn(node_a, nodes[j])
-            if distance is not None and distance <= merge_distance:
-                ra, rb = find(i), find(j)
-                if ra != rb:
-                    parent[rb] = ra
-    groups: Dict[int, List[Dict[str, Any]]] = {}
-    for i, node in enumerate(nodes):
-        groups.setdefault(find(i), []).append(node)
-    return list(groups.values())
-
-
-def complete_link_event_clusters(nodes: List[Dict[str, Any]], distance_fn: Callable[[Dict[str, Any], Dict[str, Any]], Optional[float]],
-                                 merge_distance: float) -> List[List[Dict[str, Any]]]:
-    clusters: List[List[Dict[str, Any]]] = []
-    for node in nodes:
-        best_index: Optional[int] = None
-        best_max_distance = float("inf")
-        for index, cluster in enumerate(clusters):
-            distances = [distance_fn(node, member) for member in cluster]
-            if any(distance is None for distance in distances):
-                continue
-            max_distance = max(float(distance) for distance in distances if distance is not None)
-            if max_distance <= merge_distance and max_distance < best_max_distance:
-                best_index = index
-                best_max_distance = max_distance
-        if best_index is None:
-            clusters.append([node])
-        else:
-            clusters[best_index].append(node)
-    return clusters
-
-
-def cluster_medoid(cluster: List[Dict[str, Any]], distance_fn: Callable[[Dict[str, Any], Dict[str, Any]], Optional[float]]) -> Dict[str, Any]:
-    best = cluster[0]
-    best_sum = float("inf")
-    for candidate in cluster:
-        distances = [distance_fn(candidate, other) for other in cluster]
-        if any(distance is None for distance in distances):
-            continue
-        total = sum(float(distance) for distance in distances if distance is not None)
-        if total < best_sum:
-            best = candidate
-            best_sum = total
-    return best
-
-
-def derive_f2e_graph_features(events: List[Dict[str, Any]], grid: np.ndarray,
-                              distance_mode: str = "geodesic", connectivity: int = 8,
-                              merge_distance: float = 3.25,
-                              clustering: str = "complete_link",
-                              history_frames: Optional[int] = None) -> Dict[str, Any]:
-    """Build a label-agnostic event graph using one explicit spatial metric."""
-    if distance_mode not in {"euclidean", "geodesic"}:
-        raise ValueError("distance_mode must be euclidean or geodesic")
-    if clustering not in {"single_link", "complete_link"}:
-        raise ValueError("clustering must be single_link or complete_link")
-    nodes = prepare_event_graph_nodes(events, grid, history_frames=history_frames)
-    geodesic = ObstacleAwareGeodesic(grid, connectivity=connectivity)
-    pair_cache: Dict[Tuple[int, int], Optional[float]] = {}
-    def distance_fn(a: Dict[str, Any], b: Dict[str, Any]) -> Optional[float]:
-        key = tuple(sorted((int(a["index"]), int(b["index"]))))
-        if key not in pair_cache:
-            pair_cache[key] = _event_graph_distance(a, b, distance_mode, geodesic)
-        return pair_cache[key]
-
-    if clustering == "single_link":
-        cluster_nodes = single_link_event_clusters(nodes, distance_fn, float(merge_distance))
-    else:
-        cluster_nodes = complete_link_event_clusters(nodes, distance_fn, float(merge_distance))
-    cluster_nodes.sort(key=lambda cluster: max((_event_strength_value(node["event"]) for node in cluster), default=0.0), reverse=True)
-
-    graph_nodes = []
-    for node in nodes:
-        graph_nodes.append({
-            "node_id": node["node_id"],
-            **node["summary"],
-            "centroid": [round(float(x), 3) for x in node["centroid"]],
-            "geodesic_anchor": [int(node["anchor"][0]), int(node["anchor"][1])],
-        })
-    graph_edges: List[Dict[str, Any]] = []
-    for i, node_a in enumerate(nodes):
-        for node_b in nodes[i + 1:]:
-            distance = distance_fn(node_a, node_b)
-            edge = {
-                "source": node_a["node_id"],
-                "target": node_b["node_id"],
-                "distance_unit": "grid_cell",
-                "path_exists": distance is not None,
-            }
-            edge[f"{distance_mode}_distance"] = None if distance is None else round(float(distance), 3)
-            graph_edges.append(edge)
-
-    clusters: List[Dict[str, Any]] = []
-    cluster_internal: Dict[str, List[Dict[str, Any]]] = {}
-    for number, members in enumerate(cluster_nodes, start=1):
-        cluster_id = f"C{number}"
-        medoid = cluster_medoid(members, distance_fn)
-        events_in_cluster = [member["event"] for member in members]
-        weights = np.array([max(1e-6, _event_strength_value(event)) for event in events_in_cluster], dtype=float)
-        points = np.array([member["centroid"] for member in members], dtype=float)
-        display_centroid = np.average(points, axis=0, weights=weights)
-        signatures = event_signatures_from_events(events_in_cluster)
-        cluster_internal[cluster_id] = members
-        clusters.append({
-            "cluster_id": cluster_id,
-            "node_ids": [member["node_id"] for member in members],
-            "display_centroid": [round(float(display_centroid[0]), 3), round(float(display_centroid[1]), 3)],
-            "medoid_node_id": medoid["node_id"],
-            "medoid_centroid": [round(float(x), 3) for x in medoid["centroid"]],
-            "medoid_anchor": [int(medoid["anchor"][0]), int(medoid["anchor"][1])],
-            "event_count": len(members),
-            "event_signatures": signatures,
-            "fields": sorted({str(event.get("field_key")) for event in events_in_cluster if event.get("field_key") in FIELDS}),
-            "morphologies": sorted({str(event.get("morphology")) for event in events_in_cluster if event.get("morphology")}),
-            "max_strength": round(float(max(_event_strength_value(event) for event in events_in_cluster)), 3),
-        })
-
-    cluster_relations: List[Dict[str, Any]] = []
-    separation_distances: List[float] = []
-    diversities: List[float] = []
-    for i, cluster_a in enumerate(clusters):
-        members_a = cluster_internal[str(cluster_a["cluster_id"])]
-        medoid_a = next(node for node in members_a if node["node_id"] == cluster_a["medoid_node_id"])
-        signatures_a = set(cluster_a["event_signatures"])
-        fields_a = set(cluster_a["fields"])
-        for cluster_b in clusters[i + 1:]:
-            members_b = cluster_internal[str(cluster_b["cluster_id"])]
-            medoid_b = next(node for node in members_b if node["node_id"] == cluster_b["medoid_node_id"])
-            medoid_distance = distance_fn(medoid_a, medoid_b)
-            cross_distances = [distance_fn(a, b) for a in members_a for b in members_b]
-            finite_cross = [float(distance) for distance in cross_distances if distance is not None]
-            minimum_distance = min(finite_cross) if finite_cross else None
-            signatures_b = set(cluster_b["event_signatures"])
-            fields_b = set(cluster_b["fields"])
-            union = signatures_a | signatures_b
-            jaccard = float(len(signatures_a & signatures_b) / len(union)) if union else 1.0
-            if medoid_distance is not None:
-                separation_distances.append(float(medoid_distance))
-            diversities.append(1.0 - jaccard)
-            relation = {
-                "source": cluster_a["cluster_id"],
-                "target": cluster_b["cluster_id"],
-                f"medoid_{distance_mode}_distance": None if medoid_distance is None else round(float(medoid_distance), 3),
-                f"minimum_node_{distance_mode}_distance": None if minimum_distance is None else round(float(minimum_distance), 3),
-                "distance_unit": "grid_cell",
-                "path_exists": medoid_distance is not None,
-                "signature_jaccard": round(jaccard, 3),
-                "shared_fields": sorted(fields_a & fields_b),
-                "union_fields": sorted(fields_a | fields_b),
-            }
-            cluster_relations.append(relation)
-
-    strengths = [_event_strength_value(event) for event in events]
-    area_trends: Dict[str, int] = {}
-    intensity_trends: Dict[str, int] = {}
-    for event in events:
-        temporal = event.get("temporal_summary") or {}
-        area_trend = str(temporal.get("area_trend") or "unavailable")
-        intensity_trend = str(temporal.get("intensity_trend") or "unavailable")
-        area_trends[area_trend] = area_trends.get(area_trend, 0) + 1
-        intensity_trends[intensity_trend] = intensity_trends.get(intensity_trend, 0) + 1
-
-    return {
-        "nodes": graph_nodes,
-        "edges": graph_edges,
-        "spatial_clusters": clusters,
-        "cluster_relations": cluster_relations,
-        "graph_statistics": {
-            "event_count": len(nodes),
-            "cluster_count": len(clusters),
-            "distinct_field_count": len({str(event.get("field_key")) for event in events if event.get("field_key") in FIELDS}),
-            "max_cluster_separation": round(max(separation_distances), 3) if separation_distances else 0.0,
-            "mean_cluster_separation": round(float(np.mean(separation_distances)), 3) if separation_distances else 0.0,
-            "mean_intercluster_signature_diversity": round(float(np.mean(diversities)), 3) if diversities else 0.0,
-            "max_event_strength": round(max(strengths), 3) if strengths else 0.0,
-            "mean_event_strength": round(float(np.mean(strengths)), 3) if strengths else 0.0,
-            "area_trend_counts": area_trends,
-            "intensity_trend_counts": intensity_trends,
-        },
-        "graph_metadata": {
-            "distance_metric": "obstacle_aware_geodesic" if distance_mode == "geodesic" else "euclidean_centroid",
-            "connectivity": int(connectivity) if distance_mode == "geodesic" else None,
-            "cardinal_step_cost": 1.0 if distance_mode == "geodesic" else None,
-            "diagonal_step_cost": round(math.sqrt(2.0), 6) if distance_mode == "geodesic" and int(connectivity) == 8 else None,
-            "corner_cutting": False if distance_mode == "geodesic" else None,
-            "clustering": clustering,
-            "merge_distance": float(merge_distance),
-            "distance_unit": "grid_cell",
-        },
-        "feature_policy": "label_agnostic_obstacle_aware_event_graph_v1",
-    }
+def _causal_baseline_frame_count(history_frames: int) -> int:
+    """Choose a fixed-policy early-history baseline without a tuning knob."""
+    if history_frames <= 0:
+        return 0
+    return int(min(history_frames, max(8, min(32, math.ceil(history_frames / 5.0)))))
 
 
 def _temporal_baseline_from_observations(fields_by_t: List[Dict[str, np.ndarray]],
                                           field_key: str,
                                           free_mask: np.ndarray,
-                                          baseline_frames: int = 24) -> np.ndarray:
+                                          baseline_frames: int) -> np.ndarray:
     """Observation-only temporal baseline for weak-candidate mining.
 
     This is not a clean simulator background and does not use GT masks/labels.
     It simply summarizes the earliest observed frames available to the diagnosis
     adapter, analogous to a warm-up normal reference in a streaming deployment.
     """
-    n0 = max(3, min(int(baseline_frames), max(3, len(fields_by_t) // 4), len(fields_by_t)))
+    n0 = max(1, min(int(baseline_frames), len(fields_by_t)))
     stack_items = []
     for frame in fields_by_t[:n0]:
         if field_key in frame:
@@ -2207,13 +1973,6 @@ def _nearest_confirmed_event(candidate_centroid: List[float], confirmed_events: 
 
 
 def derive_weak_candidates_from_fields(fields_by_t: List[Dict[str, np.ndarray]], free_mask: np.ndarray,
-                                       recent_frames: int = 55,
-                                       baseline_frames: int = 24,
-                                       weak_floor_z: float = 0.55,
-                                       weak_peak_z: float = 0.95,
-                                       cumulative_threshold: float = 0.24,
-                                       min_persistence: float = 0.12,
-                                       min_weak_area: int = 3,
                                        confirmed_events: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """Mine recent-window cumulative sub-threshold residuals.
 
@@ -2229,11 +1988,21 @@ def derive_weak_candidates_from_fields(fields_by_t: List[Dict[str, np.ndarray]],
             "confirmed_event_signatures": [],
             "recent_frames": 0,
             "baseline_frames": 0,
-            "residual_detector_version": "recent_window_cumulative_v2_label_agnostic",
+            "residual_detector_version": "adaptive_history_window_v3_label_agnostic",
             "note": "no observed frames",
         }
 
-    recent = fields_by_t[-max(3, int(recent_frames)):]
+    history_frames = len(fields_by_t)
+    baseline_frames = _causal_baseline_frame_count(history_frames)
+    recent_frames = max(12, int(math.ceil(history_frames / 3.0)))
+    recent = fields_by_t[-recent_frames:]
+    # These are fixed statistical policy constants in normalized z units, not
+    # experiment-facing hyperparameters. Window lengths are history-adaptive.
+    weak_floor_z = 0.55
+    weak_peak_z = 0.95
+    cumulative_threshold = 0.24
+    min_persistence = max(0.10, 3.0 / max(1, len(recent)))
+    min_weak_area = 3
     rr, cc = np.indices(free_mask.shape)
     candidates: List[Dict[str, Any]] = []
 
@@ -2272,9 +2041,10 @@ def derive_weak_candidates_from_fields(fields_by_t: List[Dict[str, np.ndarray]],
             evidence_map = (0.55 * cumulative_map + 0.25 * persistence_map + 0.20 * np.clip(peak_map / max(weak_peak_z, 1e-6), 0.0, 1.75)).astype(np.float32)
             evidence_map[~free_mask] = 0.0
             candidate_mask = free_mask & (peak_map >= float(weak_peak_z)) & (persistence_map >= float(min_persistence)) & (cumulative_map >= float(cumulative_threshold))
-            # Allow slightly lower persistence if a candidate is co-located with
-            # a strong confirmed event; this is useful for low-SNR companion
-            # fields around a thermal event.
+            # A nearby confirmed observation supplies a generic spatial anchor,
+            # so a slightly weaker provisional measurement may be retained for
+            # later graph-level corroboration. This rule is independent of field
+            # semantics and downstream diagnosis labels.
             if confirmed_events:
                 confirmed_mask_hint = np.zeros_like(candidate_mask, dtype=bool)
                 for ev in confirmed_events:
@@ -2367,8 +2137,8 @@ def derive_weak_candidates_from_fields(fields_by_t: List[Dict[str, np.ndarray]],
         "coherent_pairs": coherent_pairs,
         "confirmed_event_signatures": confirmed_sigs,
         "recent_frames": int(len(recent)),
-        "baseline_frames": int(max(3, min(int(baseline_frames), max(3, len(fields_by_t) // 4), len(fields_by_t)))),
-        "residual_detector_version": "recent_window_cumulative_v2_label_agnostic",
+        "baseline_frames": int(baseline_frames),
+        "residual_detector_version": "adaptive_history_window_v3_label_agnostic",
         "note": "Sub-threshold residual candidates are observation-derived measurements, not confirmed events or diagnosis flags.",
     }
 
@@ -2418,6 +2188,251 @@ def neutralize_subthreshold_evidence(raw: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _node_support_radius(node: Dict[str, Any]) -> float:
+    """Equivalent circular support radius derived directly from observed area."""
+    try:
+        area = max(1.0, float(node.get("area") or 1.0))
+    except Exception:
+        area = 1.0
+    return float(math.sqrt(area / math.pi))
+
+
+def _adaptive_link_limit(node_a: Dict[str, Any], node_b: Dict[str, Any]) -> float:
+    """Link overlapping measurement supports without a global distance knob."""
+    return float(max(1.0, _node_support_radius(node_a) + _node_support_radius(node_b)))
+
+
+def build_adaptive_evidence_graph(confirmed_events: List[Dict[str, Any]],
+                                  residual_evidence: Dict[str, Any],
+                                  grid: np.ndarray,
+                                  history_frames: int) -> Dict[str, Any]:
+    """Build the final compact graph directly from observed evidence.
+
+    The transformation is label agnostic: it uses only node measurements,
+    confirmation tier, temporal support, and obstacle-aware distance. Residual
+    nodes duplicate neither confirmed field/polarity signatures nor diagnosis
+    decisions. Spatial grouping uses overlap of observation-derived support
+    radii, so there is no experiment-facing distance or clustering parameter.
+    """
+    confirmed_nodes: List[Dict[str, Any]] = []
+    for event in confirmed_events:
+        centroid = _centroid_or_none(event)
+        if centroid is None:
+            continue
+        summary = summarize_events([event], max_events=1, history_frames=history_frames)[0]
+        anchor = snap_centroid_to_free(grid, centroid, event.get("mask"))
+        confirmed_nodes.append({
+            "node_id": f"E{len(confirmed_nodes) + 1}",
+            **summary,
+            "centroid": [round(float(x), 3) for x in centroid],
+            "geodesic_anchor": [int(anchor[0]), int(anchor[1])],
+        })
+    confirmed_signatures = {
+        event_signature(str(node.get("field_key")), str(node.get("polarity")))
+        for node in confirmed_nodes
+        if node.get("field_key") in FIELDS and node.get("polarity") in {"high", "low"}
+    }
+    candidates = [
+        dict(candidate)
+        for candidate in (residual_evidence.get("candidate_events") or [])
+        if candidate.get("event_signature") not in confirmed_signatures
+    ]
+    geodesic = ObstacleAwareGeodesic(grid, connectivity=8)
+    candidate_anchors: List[Optional[Tuple[int, int]]] = []
+    for candidate in candidates:
+        centroid = candidate.get("centroid")
+        if isinstance(centroid, list) and len(centroid) >= 2:
+            candidate_anchors.append(snap_centroid_to_free(grid, [float(centroid[0]), float(centroid[1])]))
+        else:
+            candidate_anchors.append(None)
+    corroborated_candidates: set = set()
+    for i, candidate_a in enumerate(candidates):
+        anchor_a = candidate_anchors[i]
+        if anchor_a is None:
+            continue
+        for j, candidate_b in enumerate(candidates[i + 1:], start=i + 1):
+            anchor_b = candidate_anchors[j]
+            if anchor_b is None or candidate_a.get("field_key") == candidate_b.get("field_key"):
+                continue
+            distance = geodesic.distance(anchor_a, anchor_b)
+            if distance is not None and float(distance) <= _adaptive_link_limit(candidate_a, candidate_b):
+                corroborated_candidates.update((i, j))
+    # A sub-threshold node is exposed only when another field independently
+    # corroborates it nearby. This suppresses isolated noise without consulting
+    # field semantics, incident templates, scenario metadata, or labels.
+    candidates = [candidate for index, candidate in enumerate(candidates) if index in corroborated_candidates]
+
+    visible_nodes: List[Dict[str, Any]] = []
+    internal_nodes: List[Dict[str, Any]] = []
+    for node in confirmed_nodes:
+        centroid = node.get("centroid")
+        if not isinstance(centroid, list) or len(centroid) < 2:
+            continue
+        centroid_pair = [float(centroid[0]), float(centroid[1])]
+        anchor_data = node.get("geodesic_anchor")
+        anchor = (
+            (int(anchor_data[0]), int(anchor_data[1]))
+            if isinstance(anchor_data, list) and len(anchor_data) >= 2
+            else snap_centroid_to_free(grid, centroid_pair)
+        )
+        visible = {
+            "node_id": node.get("node_id"),
+            "tier": "confirmed_track",
+            "field_key": node.get("field_key"),
+            "polarity": node.get("polarity"),
+            "centroid": [round(x, 3) for x in centroid_pair],
+            "area": node.get("area"),
+            "strength_z": node.get("z_core_mean"),
+            "temporal_support": node.get("track_coverage_fraction"),
+            "duration_steps": node.get("duration_steps"),
+            "area_trend": node.get("area_trend"),
+            "intensity_trend": node.get("intensity_trend"),
+        }
+        visible_nodes.append(visible)
+        internal_nodes.append({**visible, "anchor": anchor})
+
+    residual_node_count = 0
+    for index, candidate in enumerate(candidates, start=1):
+        centroid = candidate.get("centroid")
+        if not isinstance(centroid, list) or len(centroid) < 2:
+            continue
+        centroid_pair = [float(centroid[0]), float(centroid[1])]
+        anchor = snap_centroid_to_free(grid, centroid_pair)
+        node_id = f"R{index}"
+        visible = {
+            "node_id": node_id,
+            "tier": "residual_observation",
+            "field_key": candidate.get("field_key"),
+            "polarity": candidate.get("polarity"),
+            "centroid": [round(x, 3) for x in centroid_pair],
+            "area": candidate.get("area"),
+            "mean_recent_z": candidate.get("mean_recent_z"),
+            "peak_recent_z": candidate.get("peak_recent_z"),
+            "temporal_support": candidate.get("temporal_persistence"),
+            "cumulative_score": candidate.get("recent_window_cumulative_score"),
+            "trend": candidate.get("trend"),
+        }
+        residual_node_count += 1
+        visible_nodes.append(visible)
+        internal_nodes.append({**visible, "anchor": anchor})
+
+    pair_distances: Dict[Tuple[int, int], Optional[float]] = {}
+    for i, node_a in enumerate(internal_nodes):
+        for j, node_b in enumerate(internal_nodes[i + 1:], start=i + 1):
+            distance = geodesic.distance(node_a["anchor"], node_b["anchor"])
+            pair_distances[(i, j)] = distance
+
+    parent = list(range(len(internal_nodes)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    sparse_edges: List[Dict[str, Any]] = []
+    for (i, j), distance in pair_distances.items():
+        node_a, node_b = internal_nodes[i], internal_nodes[j]
+        link_limit = _adaptive_link_limit(node_a, node_b)
+        if distance is None or float(distance) > link_limit:
+            continue
+        root_i, root_j = find(i), find(j)
+        if root_i != root_j:
+            parent[root_j] = root_i
+        sparse_edges.append({
+            "source": node_a.get("node_id"),
+            "target": node_b.get("node_id"),
+            "geodesic_distance": round(float(distance), 3),
+            "adaptive_link_limit": round(float(link_limit), 3),
+            "cross_field": node_a.get("field_key") != node_b.get("field_key"),
+        })
+
+    members_by_root: Dict[int, List[int]] = {}
+    for index in range(len(internal_nodes)):
+        members_by_root.setdefault(find(index), []).append(index)
+    ordered_groups = sorted(members_by_root.values(), key=lambda members: min(members))
+    node_to_group: Dict[int, str] = {}
+    evidence_groups: List[Dict[str, Any]] = []
+    for number, members in enumerate(ordered_groups, start=1):
+        group_id = f"G{number}"
+        for index in members:
+            node_to_group[index] = group_id
+        group_nodes = [internal_nodes[index] for index in members]
+        finite_internal = [
+            float(pair_distances[(min(i, j), max(i, j))])
+            for offset, i in enumerate(members)
+            for j in members[offset + 1:]
+            if pair_distances.get((min(i, j), max(i, j))) is not None
+        ]
+        supports = [float(node.get("temporal_support")) for node in group_nodes if node.get("temporal_support") is not None]
+        points = np.asarray([node["centroid"] for node in group_nodes], dtype=float)
+        field_polarities = sorted({f"{node.get('field_key')}:{node.get('polarity')}" for node in group_nodes})
+        confirmed_count = sum(node.get("tier") == "confirmed_track" for node in group_nodes)
+        residual_count = sum(node.get("tier") == "residual_observation" for node in group_nodes)
+        amplitude_regime = "confirmed_only" if residual_count == 0 else ("residual_only" if confirmed_count == 0 else "mixed")
+        evidence_groups.append({
+            "group_id": group_id,
+            "node_ids": [node.get("node_id") for node in group_nodes],
+            "field_polarities": field_polarities,
+            "distinct_field_count": len({node.get("field_key") for node in group_nodes}),
+            "confirmed_node_count": confirmed_count,
+            "residual_node_count": residual_count,
+            "amplitude_regime": amplitude_regime,
+            "centroid": [round(float(x), 3) for x in np.mean(points, axis=0)],
+            "max_internal_distance": round(max(finite_internal), 3) if finite_internal else 0.0,
+            "mean_temporal_support": round(float(np.mean(supports)), 3) if supports else None,
+            "min_temporal_support": round(float(np.min(supports)), 3) if supports else None,
+        })
+
+    inter_group_relations: List[Dict[str, Any]] = []
+    for group_index, members_a in enumerate(ordered_groups):
+        for members_b in ordered_groups[group_index + 1:]:
+            distances = [
+                pair_distances.get((min(i, j), max(i, j)))
+                for i in members_a for j in members_b
+            ]
+            finite = [float(distance) for distance in distances if distance is not None]
+            inter_group_relations.append({
+                "source": node_to_group[members_a[0]],
+                "target": node_to_group[members_b[0]],
+                "minimum_geodesic_distance": round(min(finite), 3) if finite else None,
+                "path_exists": bool(finite),
+            })
+
+    summary = dict(residual_evidence.get("summary") or {})
+    total_confirmed = len(visible_nodes) - residual_node_count
+    graph_amplitude_regime = (
+        "none" if not visible_nodes else
+        ("confirmed_only" if residual_node_count == 0 else ("residual_only" if total_confirmed == 0 else "mixed"))
+    )
+    graph = {
+        "nodes": visible_nodes,
+        "proximity_edges": sparse_edges,
+        "evidence_groups": evidence_groups,
+        "inter_group_relations": inter_group_relations,
+        "observation_summary": {
+            "node_count": len(visible_nodes),
+            "confirmed_node_count": total_confirmed,
+            "residual_node_count": residual_node_count,
+            "amplitude_regime": graph_amplitude_regime,
+            "distinct_fields": sorted({str(node.get("field_key")) for node in visible_nodes if node.get("field_key") in FIELDS}),
+            "group_count": len(evidence_groups),
+            "residual_recent_frames": summary.get("recent_frames"),
+            "residual_baseline_frames": summary.get("baseline_frames"),
+        },
+        "graph_metadata": {
+            "distance_metric": "obstacle_aware_geodesic",
+            "connectivity": 8,
+            "grouping": "adaptive_support_radius_overlap_components",
+            "link_scale_source": "sum_of_observation_equivalent_radii",
+            "distance_unit": "grid_cell",
+            "tier_policy": "confirmed_tracks_plus_nonduplicating_residual_observations",
+        },
+        "feature_policy": "label_agnostic_parameter_free_adaptive_evidence_graph_v4",
+    }
+    return graph
+
+
 def offline_llm_proxy(payload: Dict[str, Any], mode: str) -> Dict[str, Any]:
     # Deterministic proxy for dry-run pipeline validation. It deliberately uses
     # only the same public input representation that would be sent to the model.
@@ -2439,12 +2454,14 @@ def diagnose_from_matrix_summary(field_summary: Dict[str, Any]) -> Dict[str, Any
 COMMON_TASK_PROMPT = (
     "You are an industrial multi-physics accident diagnosis module. Return only one valid JSON object without markdown. "
     f"Allowed accident_type labels: {', '.join(ACCIDENT_TYPES)}. "
-    "Use this common incident ontology for every representation: fire is high temperature with combustion-side air-quality and/or CO2 evidence; "
-    "electrical_overheat is primarily isolated high temperature without combustion-side or humidity support; "
-    "water_leak is humidity-dominant without the full thermal-pressure steam pattern; steam_leak is high humidity with high temperature and high pressure; "
-    "co2_accumulation requires CO2-specific evidence; dust_pollution is air-quality evidence without CO2 support; "
+    "Use this common incident ontology for every representation: fire is material full-amplitude high temperature with combustion-side air-quality and/or CO2 evidence; "
+    "electrical_overheat is primarily material full-amplitude isolated high temperature without combustion-side or humidity support; "
+    "water_leak is material full-amplitude humidity-dominant evidence without the full thermal-pressure steam pattern; "
+    "steam_leak is material full-amplitude high humidity with high temperature and high pressure; "
+    "co2_accumulation requires material full-amplitude CO2-specific evidence; dust_pollution is material full-amplitude air-quality evidence without CO2 support; "
     "composite_anomaly requires two or more spatially distinct evidence groups supporting different incident patterns; "
-    "low_snr_anomaly requires persistent, mutually consistent, low-amplitude evidence across multiple fields; "
+    "low_snr_anomaly is a cross-field abnormal pattern supported only by mutually corroborating, temporally persistent sub-threshold measurements; "
+    "it is distinct from the same field combination supported by confirmed tracks; "
     "needs_review_unknown means observation quality is insufficient, evidence is contradictory, or no known template adequately explains the material evidence; "
     "normal means no material abnormal evidence under adequate observation quality. "
     "Use only the supplied observation at the fixed diagnosis time. Never assume scenario identifiers, testcase names, injected effects, expected labels, "
@@ -2453,6 +2470,8 @@ COMMON_TASK_PROMPT = (
     "observation; (2) inventory every material observation-derived evidence unit that the supplied representation actually contains; (3) test whether one "
     "known physical process parsimoniously explains all such evidence; (4) mark reliable evidence that is not explained by that process as "
     "supports_alternative or unexplained instead of inventing an unsupported secondary cause. Do not assume evidence that the representation does not provide. "
+    "For any representation that distinguishes evidence tiers, corroboration across fields, temporal persistence, and spatial organization can make a set of "
+    "individually sub-threshold measurements material, whereas one isolated or transient sub-threshold measurement is insufficient by itself. "
     "known_template is valid only when no material evidence remains unexplained. A single defining field can support an incident hypothesis when the ontology is "
     "field-dominant, but composite_anomaly still requires spatially distinct groups that support different incident patterns. Spatial separation alone is not "
     "sufficient for composite_anomaly when the separated measurements are complementary parts of one known coupled pattern. If any material evidence is assigned "
@@ -2493,16 +2512,22 @@ REPRESENTATION_ADAPTERS: Dict[str, str] = {
         "track-extraction reliability rather than incident evidence; widespread noise makes an empty active-track list weaker negative evidence."
     ),
     "f2e_events_graph": (
-        "Representation adapter: the observation is an F2E event graph. Each node is an observation-derived tracked event. graph_metadata defines whether "
-        "edge distances are centroid Euclidean distances or obstacle-aware geodesic distances. geodesic_anchor is the nearest valid free-space grid cell selected "
-        "from the event mask when available. For geodesic distance, edges record the shortest free-space path between anchors; obstacles are impassable, cardinal "
-        "moves cost 1, diagonal moves cost sqrt(2) when enabled, and diagonal corner cutting is forbidden. null distance means no free-space path exists. "
-        "Clusters are formed by a conservative computational distance/linkage threshold. Separate clusters can still be complementary measurements of one "
-        "physical process because field footprints, obstacles, and event anchors differ. Each graph node maps directly to one evidence_events item. Cluster "
-        "membership, medoids, and distances describe spatial organization only; they are not semantic labels and do not encode downstream diagnostic conclusions. "
-        "An empty graph means no F2E track crossed "
-        "confirmation at this time. high_noise_fields and temporal-noise statistics, when supplied, describe graph-construction reliability rather than incident "
-        "evidence; widespread noise makes an empty graph weaker negative evidence."
+        "Representation adapter: the observation is a compact unified F2E evidence graph. Each node is either a confirmed_track or a residual_observation; "
+        "the latter is a causal sub-threshold measurement and is not equivalent to a confirmed track. temporal_support is track coverage for confirmed nodes and "
+        "recent-window persistence for residual nodes. proximity_edges and evidence_groups use fixed obstacle-aware geodesic distance and an adaptive link limit "
+        "equal to the sum of the two observation-derived support radii; there is no experiment-supplied merge or clustering parameter. "
+        "They summarize measurement organization, not incident semantics or expected decisions. A residual field/polarity already represented by a confirmed node "
+        "is omitted to prevent double counting. amplitude_regime is a direct tier-count summary, not a diagnosis. Use every reliable node in the evidence ledger. "
+        "Persistent cross-field corroboration can make residual observations material; an isolated or transient residual observation should be down-weighted. "
+        "A residual_only group can establish a real abnormal pattern, but it is not full-amplitude evidence and therefore cannot satisfy a full-amplitude incident "
+        "template. Its amplitude tier must remain part of the classification. Treat nodes connected into one evidence group as spatially associated, "
+        "while using inter_group_relations to assess genuinely separated activity. Multiple groups do not automatically imply a composite incident because separated "
+        "measurements may still be complementary parts of one physical process. Apply the shared ontology independently to each reliable evidence group before the "
+        "global decision; field-dominant ontology entries remain field-dominant at group level. If separate groups support different incident patterns, account for "
+        "both rather than discarding a smaller group. Conversely, proximity does not make one field semantically explain another. Do not invent a causal coupling "
+        "that is absent from the supplied ontology merely to force known_template. If a supplied field/polarity is not explained by the selected ontology, retain it "
+        "as supports_alternative or unexplained. An empty graph means neither a "
+        "confirmed track nor an admitted residual observation was available at diagnosis time; interpret that absence together with observation_quality."
     ),
     "raw_matrix_summary": (
         "Representation adapter: field_summary contains statistics rather than full matrices. mean, min, max, and std are current-frame spatial statistics; "
@@ -2576,7 +2601,7 @@ def save_prompt_templates(out_dir: str) -> None:
 # ============================================================
 # Layer 2 diagnosis
 # ============================================================
-def method_display_name(method: str, graph_distance: str = "geodesic") -> str:
+def method_display_name(method: str) -> str:
     names = {
         "f2e_events_llm": "F2E + LLM",
         "threshold_matrix_llm": "Threshold + LLM",
@@ -2586,30 +2611,64 @@ def method_display_name(method: str, graph_distance: str = "geodesic") -> str:
         "raw_field_image_vlm": "Raw Field Image + VLM",
     }
     if method == "f2e_events_graph_llm":
-        return "F2E Geodesic Graph + LLM" if graph_distance == "geodesic" else "F2E Euclidean Graph + LLM"
+        return "F2E Parameter-free Adaptive Evidence Graph + LLM"
     return names.get(method, method)
 
 
 def normalize_diag(diag: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not isinstance(diag, dict):
-        return {"accident_type": "needs_review_unknown", "confidence": 0.0, "review_needed": True, "abnormal_confirmed": False, "resample_target": None, "evidence_fields": [], "evidence_events": [], "unexplained_evidence": [], "template_status": "invalid_output", "explanation": "invalid or missing model output"}
-    label = str(diag.get("accident_type", "needs_review_unknown"))
+        return {"accident_type": "needs_review_unknown", "raw_prediction": None, "confidence": 0.0, "review_needed": True, "abnormal_confirmed": False, "resample_target": None, "evidence_fields": [], "evidence_events": [], "unexplained_evidence": [], "template_status": "invalid_output", "protocol_conflict": True, "protocol_conflict_reasons": ["invalid_or_missing_model_output"], "protocol_consistency_repair": False, "explanation": "invalid or missing model output"}
+    raw_label = str(diag.get("accident_type", "needs_review_unknown"))
+    label = raw_label
     if label not in ACCIDENT_TYPES:
         label = "needs_review_unknown"
     try:
         conf = float(diag.get("confidence", 0.0))
     except Exception:
         conf = 0.0
+    evidence_events = diag.get("evidence_events", []) if isinstance(diag.get("evidence_events", []), list) else []
+    unexplained_evidence = diag.get("unexplained_evidence", []) if isinstance(diag.get("unexplained_evidence", []), list) else []
+    template_status = str(diag.get("template_status", ""))
+    review_needed = bool(diag.get("review_needed", label == "needs_review_unknown"))
+    abnormal_confirmed = bool(diag.get("abnormal_confirmed", label not in {"normal", "needs_review_unknown"} and conf >= 0.55))
+    non_selected_roles = any(
+        isinstance(item, dict) and item.get("role") in {"supports_alternative", "unexplained"}
+        for item in evidence_events
+    )
+    known_incident_labels = {
+        "fire", "electrical_overheat", "water_leak", "steam_leak",
+        "co2_accumulation", "dust_pollution",
+    }
+    conflict_reasons: List[str] = []
+    if raw_label not in ACCIDENT_TYPES:
+        conflict_reasons.append("invalid_accident_type")
+    if label in known_incident_labels and unexplained_evidence:
+        conflict_reasons.append("known_label_with_unexplained_evidence")
+    if label in known_incident_labels and non_selected_roles:
+        conflict_reasons.append("known_label_with_non_selected_evidence_role")
+    if label in known_incident_labels and template_status in {"novel_combination", "insufficient_data"}:
+        conflict_reasons.append("known_label_with_non_known_template_status")
+    if label in known_incident_labels and review_needed:
+        conflict_reasons.append("known_label_with_review_needed")
+    if label == "needs_review_unknown" and not review_needed:
+        conflict_reasons.append("review_label_without_review_needed")
+    if label == "normal" and abnormal_confirmed:
+        conflict_reasons.append("normal_label_with_abnormal_confirmed")
     return {
         "accident_type": label,
+        "raw_prediction": raw_label,
         "confidence": max(0.0, min(1.0, conf)),
-        "review_needed": bool(diag.get("review_needed", label == "needs_review_unknown")),
-        "abnormal_confirmed": bool(diag.get("abnormal_confirmed", label not in {"normal", "needs_review_unknown"} and conf >= 0.55)),
+        "review_needed": review_needed,
+        "abnormal_confirmed": abnormal_confirmed,
         "resample_target": diag.get("resample_target"),
         "evidence_fields": diag.get("evidence_fields", []) if isinstance(diag.get("evidence_fields", []), list) else [],
-        "evidence_events": diag.get("evidence_events", []) if isinstance(diag.get("evidence_events", []), list) else [],
-        "unexplained_evidence": diag.get("unexplained_evidence", []) if isinstance(diag.get("unexplained_evidence", []), list) else [],
-        "template_status": str(diag.get("template_status", "")),
+        "evidence_events": evidence_events,
+        "unexplained_evidence": unexplained_evidence,
+        "template_status": template_status,
+        "protocol_conflict": bool(conflict_reasons),
+        "protocol_conflict_reasons": conflict_reasons,
+        # Kept as a stable legacy column: v8.6.2 never rewrites valid labels.
+        "protocol_consistency_repair": False,
         "explanation": str(diag.get("explanation", "")),
     }
 
@@ -2835,9 +2894,6 @@ def build_method_inputs(trace_f2e: RunTrace, image_dir: str,
                         vlm_frame_mode: str = "sampled", vlm_num_frames: int = 8,
                         llm_interval_steps: int = 50, scenario_index: int = 0,
                         render_raw_image: bool = True,
-                        graph_distance: str = "geodesic", graph_connectivity: int = 8,
-                        graph_merge_distance: float = 3.25,
-                        graph_clustering: str = "complete_link",
                         threshold_only: bool = False) -> Dict[str, Dict[str, Any]]:
     diag_t = diagnosis_query_t(trace_f2e.scenario, len(trace_f2e.fields_window), llm_interval_steps)
     history_frames = int(diag_t) + 1
@@ -2854,13 +2910,19 @@ def build_method_inputs(trace_f2e: RunTrace, image_dir: str,
         matrix_summary["observation_quality"] = obs_quality
     matrix_latency_ms = (time.perf_counter() - matrix_t0) * 1000.0
     graph_t0 = time.perf_counter()
-    f2e_graph_features = {} if threshold_only else derive_f2e_graph_features(
+    if threshold_only:
+        f2e_graph_features = {}
+    else:
+        residual_raw = derive_weak_candidates_from_fields(
+            fields_for_diagnosis,
+            trace_f2e.grid == 0,
+            confirmed_events=f2e_events_raw,
+        )
+        residual_evidence = neutralize_subthreshold_evidence(residual_raw)
+        f2e_graph_features = build_adaptive_evidence_graph(
             f2e_events_raw,
+            residual_evidence,
             grid=trace_f2e.grid,
-            distance_mode=graph_distance,
-            connectivity=graph_connectivity,
-            merge_distance=graph_merge_distance,
-            clustering=graph_clustering,
             history_frames=history_frames,
         )
     graph_latency_ms = (time.perf_counter() - graph_t0) * 1000.0
@@ -3018,9 +3080,6 @@ def run_layer2(scenarios: List[AccidentScenario], seeds: int, steps: int, obs_ra
                vlm_num_frames: int = 8, llm_interval_steps: int = 50,
                token_counter: Optional[TokenFallbackCounter] = None,
                methods: Optional[List[str]] = None,
-               graph_distance: str = "geodesic", graph_connectivity: int = 8,
-               graph_merge_distance: float = 3.25,
-               graph_clustering: str = "complete_link",
                api_workers: int = 1) -> Tuple[List[Dict[str, Any]], int]:
     diag_rows: List[Dict[str, Any]] = []
     job = start_job
@@ -3041,8 +3100,6 @@ def run_layer2(scenarios: List[AccidentScenario], seeds: int, steps: int, obs_ra
             method_inputs = build_method_inputs(
                 trace_f2e, image_dir, vlm_frame_mode, vlm_num_frames,
                 llm_interval_steps, scenario_index=sc_idx, render_raw_image=need_raw_image,
-                graph_distance=graph_distance, graph_connectivity=graph_connectivity,
-                graph_merge_distance=graph_merge_distance, graph_clustering=graph_clustering,
                 threshold_only=threshold_only,
             )
             diag_t = int((method_inputs.get("diagnosis_t") or {}).get("t", steps - 1))
@@ -3156,10 +3213,11 @@ def run_layer2(scenarios: List[AccidentScenario], seeds: int, steps: int, obs_ra
                     "seed": seed,
                     "scenario_id": sc.scenario_id,
                     "method": method,
-                    "method_display_name": method_display_name(method, graph_distance),
+                    "method_display_name": method_display_name(method),
                     "valid_prediction": int(valid_prediction),
                     "ground_truth": sc.accident_type,
                     "prediction": diag.get("accident_type"),
+                    "raw_prediction": diag.get("raw_prediction", diag.get("accident_type")),
                     "correct": correct,
                     "ambiguous": sc.ambiguous,
                     "unseen_combo": sc.unseen_combo,
@@ -3197,6 +3255,9 @@ def run_layer2(scenarios: List[AccidentScenario], seeds: int, steps: int, obs_ra
                     "reported_event_signatures": ";".join(reasoning_scores["reported_event_signatures"]),
                     "unexplained_evidence": ";".join(map(str, diag.get("unexplained_evidence", []))),
                     "template_status": diag.get("template_status"),
+                    "protocol_conflict": int(bool(diag.get("protocol_conflict", False))),
+                    "protocol_conflict_reasons": ";".join(map(str, diag.get("protocol_conflict_reasons", []))),
+                    "protocol_consistency_repair": int(bool(diag.get("protocol_consistency_repair", False))),
                     "prompt_tokens": call_res.prompt_tokens,
                     "completion_tokens": call_res.completion_tokens,
                     "total_tokens": call_res.total_tokens,
@@ -3263,6 +3324,9 @@ def aggregate_layer2(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "n": len(rs),
             "valid_prediction_n": int(sum(int(r.get("valid_prediction", 0)) for r in rs)),
             "invalid_prediction_n": int(sum(1 - int(r.get("valid_prediction", 0)) for r in rs)),
+            "protocol_conflict_n": int(sum(1 if r.get("protocol_conflict") else 0 for r in rs)),
+            "protocol_conflict_rate": round(float(np.mean([1 if r.get("protocol_conflict") else 0 for r in rs])), 6) if rs else None,
+            "protocol_consistency_repair_n": int(sum(1 if r.get("protocol_consistency_repair") else 0 for r in rs)),
             "token_applicable_n": len(token_applicable_rows),
             "token_measured_n": len(token_measured_rows),
             "token_missing_n": len(missing_token_rows),
@@ -3345,6 +3409,8 @@ def aggregate_layer2_by_family(rows: List[Dict[str, Any]]) -> List[Dict[str, Any
             "expected_review_success": round(float(np.mean([1 if r.get("review_needed") else 0 for r in expected_review])), 6) if expected_review else None,
             "template_rejection_success": round(float(safe_mean([r.get("template_rejection_success") for r in rs])), 6) if safe_mean([r.get("template_rejection_success") for r in rs]) is not None else None,
             "forbidden_prediction_avoidance": round(float(safe_mean([r.get("forbidden_prediction_score") for r in rs])), 6) if safe_mean([r.get("forbidden_prediction_score") for r in rs]) is not None else None,
+            "protocol_conflict_n": int(sum(1 if r.get("protocol_conflict") else 0 for r in rs)),
+            "protocol_conflict_rate": round(float(np.mean([1 if r.get("protocol_conflict") else 0 for r in rs])), 6) if rs else None,
         })
     return out
 
@@ -3490,10 +3556,6 @@ def main() -> None:
     ap.add_argument("--api-retry-backoff", type=float, default=1.0, help="initial exponential retry backoff in seconds")
     ap.add_argument("--api-workers", type=int, default=5,
                     help="parallel independent model calls per scenario; 1 reproduces serial scheduling, 5 runs the five model methods together")
-    ap.add_argument("--graph-distance", choices=["euclidean", "geodesic"], default="geodesic")
-    ap.add_argument("--graph-connectivity", choices=[4, 8], type=int, default=8)
-    ap.add_argument("--graph-merge-distance", type=float, default=3.25)
-    ap.add_argument("--graph-clustering", choices=["single_link", "complete_link"], default="complete_link")
     ap.add_argument("--token-fallback", choices=["none", "hf_tokenizer", "heuristic"], default="none",
                     help="Fallback token counting only when API usage is missing. Default none keeps token metrics API-measured only.")
     ap.add_argument("--tokenizer-model", default=None,
@@ -3547,10 +3609,6 @@ def main() -> None:
                                   args.api_mode, client, args.llm_model, args.vlm_model, progress, job,
                                   args.vlm_frame_mode, args.vlm_num_frames, args.llm_interval_steps, token_counter,
                                   methods=layer2_methods,
-                                  graph_distance=args.graph_distance,
-                                  graph_connectivity=args.graph_connectivity,
-                                  graph_merge_distance=args.graph_merge_distance,
-                                  graph_clustering=args.graph_clustering,
                                   api_workers=args.api_workers)
     client.flush_cache()
     progress.update(total_jobs, "done")
@@ -3566,7 +3624,7 @@ def main() -> None:
         "profile": args.profile,
         "experiment_scope": "layer2_comprehensive_comparison_only",
         "layer2_methods": layer2_methods,
-        "layer2_method_display_names": {name: method_display_name(name, args.graph_distance) for name in layer2_methods},
+        "layer2_method_display_names": {name: method_display_name(name) for name in layer2_methods},
         "seeds": seeds,
         "steps": steps,
         "n_scenarios": len(scenarios),
@@ -3595,10 +3653,9 @@ def main() -> None:
             "With api_workers>1, absolute latency is measured under balanced within-scenario concurrent load and should not be compared "
             "directly with absolute latency from a serial run; prompts, predictions, tokens, seeds, and scoring are unchanged."
         ),
-        "graph_distance": args.graph_distance,
-        "graph_connectivity": args.graph_connectivity,
-        "graph_merge_distance": args.graph_merge_distance,
-        "graph_clustering": args.graph_clustering,
+        "graph_distance_policy": "fixed_obstacle_aware_geodesic_8_neighbor_no_corner_cutting",
+        "graph_grouping_policy": "adaptive_support_radius_overlap_components_no_distance_hyperparameter",
+        "graph_residual_window_policy": "history_adaptive_early_fifth_baseline_recent_third_window",
         "token_fallback": args.token_fallback,
         "tokenizer_model": token_counter.tokenizer_model,
         "tokenizer_local_files_only": not args.tokenizer_allow_download,
@@ -3606,8 +3663,11 @@ def main() -> None:
         "token_accounting_note": "Primary token metrics use DashScope/OpenAI-compatible response usage. Rules have token_not_applicable_n and blank token columns; fallback counts are estimates and flagged per row.",
         "threshold_method_policy": "per_cell_phase_i_fixed_three_sigma_alarm_matrix_v1; no connected components, centroids, morphology, tracks, or event tokens",
         "threshold_only_raw_observation_fast_path": bool(layer2_methods) and set(layer2_methods).issubset({"threshold_matrix_llm", "threshold_matrix_rules"}),
-        "graph_feature_policy": "label_agnostic_obstacle_aware_event_graph_v1",
-        "llm_prompt_policy": "shared_representation_neutral_evidence_core_plus_semantic_adapter_v3",
+        "graph_feature_policy": "label_agnostic_parameter_free_adaptive_evidence_graph_v4",
+        "graph_residual_policy": "causal_history_adaptive_residuals_no_experiment_facing_hyperparameters_v2",
+        "llm_prompt_policy": "shared_representation_neutral_evidence_core_plus_compact_graph_adapter_v6",
+        "output_constraint_policy": "representation_neutral_evidence_ledger_conflict_audit_only_v2",
+        "primary_prediction_policy": "score_normalized_raw_model_label_no_protocol_rewrite_v1",
         "f2e_event_policy": "active_tracks_with_normalized_temporal_coverage_v1",
         "vlm_input_policy": "image_only_plus_visual_format_adapter_v1",
         "offline_graph_policy": "no_simulated_graph_gain; api_mode_api_required_for_graph_llm_claims",
@@ -3653,9 +3713,9 @@ def main() -> None:
     print(f"\n===== Comprehensive F2E/LLM/VLM Comparison {COMPARISON_VERSION} =====")
     print(f"core={CORE_VERSION} scope=layer2_only profile={args.profile} seeds={seeds} steps={steps} scenarios={len(scenarios)}")
     print(f"api_mode={args.api_mode} api_key_present={bool(api_key)} dashscope_proxy_mode={args.dashscope_proxy_mode} api_workers={args.api_workers} scheduling={'parallel_within_scenario' if args.api_workers > 1 else 'serial'} llm_model={args.llm_model} vlm_model={args.vlm_model} vlm_frame_mode={args.vlm_frame_mode} vlm_num_frames={args.vlm_num_frames} llm_interval_steps={args.llm_interval_steps} thinking={args.enable_thinking}")
-    print(f"graph_distance={args.graph_distance} connectivity={args.graph_connectivity} clustering={args.graph_clustering} merge_distance={args.graph_merge_distance}")
+    print("graph_policy=parameter_free_adaptive_geodesic_support_overlap residual_window=history_adaptive")
     print(f"token_accounting=api_usage_primary fallback={args.token_fallback} tokenizer={token_counter.tokenizer_model}")
-    print("NO-LEAK CHECK: the F2E encoder sees only current_fields; model-visible graph features are label-agnostic topology/statistics with no compound/novel/weak decision flags.")
+    print("NO-LEAK CHECK: the F2E encoder and residual graph see only causal observed fields; model-visible graph features contain measurements/topology and confirmation tiers, with no scenario IDs, labels, GT masks, injected-effect metadata, or compound/novel/low-SNR decision flags.")
     if layer2_summary:
         print("\nLayer 2 summary:")
         for r in layer2_summary:

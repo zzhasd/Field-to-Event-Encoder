@@ -1,9 +1,8 @@
-"""Visualize the merged comprehensive experiment with the v8.5.3 threshold baseline.
+"""Visualize the v8.8.0 seven-method, fourteen-scenario comparison.
 
-The figure follows visual1_full_methods_tokens_dual_axis_token_bar.py: four
-diagnosis-score bars use the left axis, mean token consumption uses the right
-axis, and seed-level dots plus 95% Student-t confidence intervals expose the
-variation across the ten repeated seeds.
+Four diagnosis-score bars use the left axis, mean token consumption uses the
+right axis, and seed-level dots plus 95% Student-t confidence intervals expose
+variation across the ten repeated seeds. Rule methods report token usage as N/A.
 """
 from __future__ import annotations
 
@@ -24,7 +23,7 @@ from scipy.stats import t as student_t
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_OUT_DIR = os.path.join(
-    SCRIPT_DIR, "outputs", "comprehensive_v8_5_2_geodesic_full_parallel"
+    SCRIPT_DIR, "outputs", "comprehensive_v880_all_7methods_14scenarios_10seeds"
 )
 
 ACCIDENT_TYPES = [
@@ -51,7 +50,7 @@ METHOD_ORDER = [
 ]
 
 METHOD_LABELS = {
-    "f2e_events_graph_llm": "F2E graph + LLM",
+    "f2e_events_graph_llm": "Adaptive graph + LLM",
     "f2e_events_llm": "F2E + LLM",
     "threshold_matrix_llm": "Threshold + LLM",
     "raw_matrix_summary_llm": "Raw matrix + LLM",
@@ -77,18 +76,19 @@ METRIC_LABELS = {
 SCORE_COLORS = ["#4C78A8", "#F58518", "#54A24B", "#E45756"]
 TOKEN_COLOR = "#6F4E9C"
 CONFIDENCE_LEVEL = 0.95
-ZERO_DOT_DISPLAY_VALUE = 0.15
+EXPECTED_SEEDS = 10
+EXPECTED_SCENARIOS_PER_SEED = 14
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Plot all merged Layer-2 methods and token consumption."
+        description="Plot the v8.8.0 seven-method scores and token consumption."
     )
     parser.add_argument("--out-dir", default=DEFAULT_OUT_DIR)
     parser.add_argument(
         "--fig-dir",
         default=None,
-        help="Defaults to <out-dir>/figures_threshold_v853_merged.",
+        help="Defaults to <out-dir>/figures_v880_all7_dual_axis.",
     )
     return parser.parse_args()
 
@@ -203,20 +203,24 @@ def point_x_positions(center: float, count: int, width: float) -> np.ndarray:
 
 
 def shown_points(values: np.ndarray) -> np.ndarray:
-    values = np.asarray(values, dtype=float).copy()
-    values[np.isclose(values, 0.0)] = ZERO_DOT_DISPLAY_VALUE
-    return values
+    return np.asarray(values, dtype=float)
 
 
 def validate_inputs(summary: pd.DataFrame, records: pd.DataFrame) -> None:
     required_summary = {"method", "mean_total_tokens", *METRICS}
     required_records = {
+        "ambiguous",
+        "diagnostic_goal",
+        "expected_review",
+        "hard_family",
         "method",
+        "reasoning_alignment_score",
         "seed_index",
         "seed",
         "ground_truth",
         "prediction",
         "correct",
+        "template_rejection_success",
         "total_tokens",
         "token_count_source",
     }
@@ -226,10 +230,54 @@ def validate_inputs(summary: pd.DataFrame, records: pd.DataFrame) -> None:
         raise ValueError("Summary CSV is missing: " + ", ".join(missing_summary))
     if missing_records:
         raise ValueError("Records CSV is missing: " + ", ".join(missing_records))
-    available = set(summary["method"].astype(str))
-    missing_methods = [method for method in METHOD_ORDER if method not in available]
+    summary_methods = summary["method"].astype(str)
+    available = set(summary_methods)
+    expected = set(METHOD_ORDER)
+    missing_methods = sorted(expected - available)
+    unexpected_methods = sorted(available - expected)
     if missing_methods:
-        raise ValueError("Merged data is missing methods: " + ", ".join(missing_methods))
+        raise ValueError("Summary data is missing methods: " + ", ".join(missing_methods))
+    if unexpected_methods:
+        raise ValueError(
+            "Summary data contains unexpected methods: " + ", ".join(unexpected_methods)
+        )
+    if summary_methods.duplicated().any():
+        duplicates = sorted(summary_methods[summary_methods.duplicated()].unique())
+        raise ValueError("Summary data duplicates methods: " + ", ".join(duplicates))
+
+    record_methods = set(records["method"].astype(str))
+    if record_methods != expected:
+        missing = sorted(expected - record_methods)
+        unexpected = sorted(record_methods - expected)
+        details = []
+        if missing:
+            details.append("missing " + ", ".join(missing))
+        if unexpected:
+            details.append("unexpected " + ", ".join(unexpected))
+        raise ValueError("Record method mismatch: " + "; ".join(details))
+
+    seed_counts = records.groupby("method")["seed_index"].nunique()
+    invalid_seed_counts = seed_counts[seed_counts.ne(EXPECTED_SEEDS)]
+    if not invalid_seed_counts.empty:
+        details = ", ".join(
+            f"{method}={count}" for method, count in invalid_seed_counts.items()
+        )
+        raise ValueError(
+            f"Expected {EXPECTED_SEEDS} seeds per method; found {details}"
+        )
+
+    scenario_counts = records.groupby(["method", "seed_index"]).size()
+    invalid_scenario_counts = scenario_counts[
+        scenario_counts.ne(EXPECTED_SCENARIOS_PER_SEED)
+    ]
+    if not invalid_scenario_counts.empty:
+        details = ", ".join(
+            f"{method}/seed{seed_index}={count}"
+            for (method, seed_index), count in invalid_scenario_counts.items()
+        )
+        raise ValueError(
+            f"Expected {EXPECTED_SCENARIOS_PER_SEED} scenarios per seed; found {details}"
+        )
 
 
 def main() -> None:
@@ -237,7 +285,7 @@ def main() -> None:
     out_dir = os.path.abspath(args.out_dir)
     fig_dir = os.path.abspath(
         args.fig_dir
-        or os.path.join(out_dir, "figures_threshold_v853_merged")
+        or os.path.join(out_dir, "figures_v880_all7_dual_axis")
     )
     os.makedirs(fig_dir, exist_ok=True)
 
@@ -384,7 +432,7 @@ def main() -> None:
         [METHOD_LABELS[m] for m in METHOD_ORDER], fontsize=14, fontweight="bold"
     )
     score_axis.set_ylabel("Score (%)", fontsize=20, fontweight="bold")
-    score_axis.set_ylim(0, 118)
+    score_axis.set_ylim(-3, 118)
     score_axis.grid(axis="y", linestyle="--", alpha=0.35)
     score_axis.margins(x=0.04)
     score_axis.tick_params(axis="y", labelsize=15)
@@ -415,10 +463,10 @@ def main() -> None:
     figure.tight_layout(pad=0.15)
 
     png_path = safe_output_path(
-        os.path.join(fig_dir, "layer2_all_methods_threshold_v853_tokens_dual_axis.png")
+        os.path.join(fig_dir, "layer2_v880_all7_scores_tokens_dual_axis.png")
     )
     pdf_path = safe_output_path(
-        os.path.join(fig_dir, "layer2_all_methods_threshold_v853_tokens_dual_axis.pdf")
+        os.path.join(fig_dir, "layer2_v880_all7_scores_tokens_dual_axis.pdf")
     )
     figure.savefig(png_path, dpi=300, bbox_inches="tight", pad_inches=0.01)
     figure.savefig(pdf_path, bbox_inches="tight", pad_inches=0.01)
