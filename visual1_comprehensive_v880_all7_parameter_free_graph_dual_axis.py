@@ -78,6 +78,7 @@ TOKEN_COLOR = "#6F4E9C"
 CONFIDENCE_LEVEL = 0.95
 EXPECTED_SEEDS = 10
 EXPECTED_SCENARIOS_PER_SEED = 14
+ZERO_SCORE_DISPLAY_PERCENT = 0.1
 
 
 def parse_args() -> argparse.Namespace:
@@ -203,7 +204,13 @@ def point_x_positions(center: float, count: int, width: float) -> np.ndarray:
 
 
 def shown_points(values: np.ndarray) -> np.ndarray:
-    return np.asarray(values, dtype=float)
+    """Lift exact zero scores slightly for visibility without changing labels/data."""
+    values = np.asarray(values, dtype=float)
+    return np.where(
+        np.isclose(values, 0.0, rtol=0.0, atol=1e-12),
+        ZERO_SCORE_DISPLAY_PERCENT,
+        values,
+    )
 
 
 def validate_inputs(summary: pd.DataFrame, records: pd.DataFrame) -> None:
@@ -328,10 +335,11 @@ def main() -> None:
     for metric_index, (metric, color) in enumerate(zip(METRICS, SCORE_COLORS)):
         offset = (metric_index - (group_count - 1) / 2.0) * bar_width
         means = np.asarray([score_stats[(m, metric)][0] for m in METHOD_ORDER])
+        shown_means = shown_points(means)
         cis = np.asarray([score_stats[(m, metric)][1] for m in METHOD_ORDER])
         bars = score_axis.bar(
             x + offset,
-            means,
+            shown_means,
             width=bar_width,
             color=color,
             label=METRIC_LABELS[metric],
@@ -352,7 +360,7 @@ def main() -> None:
             )
         score_axis.errorbar(
             x + offset,
-            means,
+            shown_means,
             yerr=cis,
             fmt="none",
             ecolor=dark,
@@ -432,7 +440,7 @@ def main() -> None:
         [METHOD_LABELS[m] for m in METHOD_ORDER], fontsize=14, fontweight="bold"
     )
     score_axis.set_ylabel("Score (%)", fontsize=20, fontweight="bold")
-    score_axis.set_ylim(-3, 118)
+    score_axis.set_ylim(0, 118)
     score_axis.grid(axis="y", linestyle="--", alpha=0.35)
     score_axis.margins(x=0.04)
     score_axis.tick_params(axis="y", labelsize=15)
@@ -440,6 +448,7 @@ def main() -> None:
     token_axis.tick_params(axis="y", labelsize=15, colors=TOKEN_COLOR, width=2.0)
     token_axis.spines["right"].set_color(TOKEN_COLOR)
     token_axis.spines["right"].set_linewidth(2.0)
+    token_axis.set_ylim(bottom=0)
     for axis in (score_axis, token_axis):
         for tick in axis.get_yticklabels():
             tick.set_fontweight("bold")

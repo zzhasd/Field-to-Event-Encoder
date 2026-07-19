@@ -13,18 +13,18 @@ df = pd.read_csv(csv_path)
 # 2. 指标设置
 # =========================
 metrics = {
-    "F1": "detection_f1",
-    "Mean IoU": "mean_iou",
-    "Shape Acc.": "shape_accuracy",
-    "Trend Acc.": "trend_accuracy",
-    "Latency steps ↓": "latency_steps",
+    "Detection\nF1": "detection_f1",
+    "Mean\nIoU": "mean_iou",
+    "Shape\nAcc.": "shape_accuracy",
+    "Trend\nAcc.": "trend_accuracy",
+    "Latency\nSteps↓": "latency_steps",
 }
 
 # 正向指标：越大越好
-positive_metrics = ["F1", "Mean IoU", "Shape Acc.", "Trend Acc."]
+positive_metrics = ["Detection\nF1", "Mean\nIoU", "Shape\nAcc.", "Trend\nAcc."]
 
 # 负向指标：越小越好
-negative_metrics = ["Latency steps ↓"]
+negative_metrics = ["Latency\nSteps↓"]
 
 # =========================
 # 3. 以 full 为基准计算相对变化
@@ -48,11 +48,11 @@ for m in negative_metrics:
 delta_plot = delta[delta["variant"] != "full"].copy()
 
 variant_name_map = {
-    "ablate_no_bg_ema": "w/o \n BG EMA",
-    "ablate_no_cumulative_score": "w/o  \n Cumulative \n Score",
-    "ablate_no_hysteresis": "w/o \n Hysteresis",
-    "ablate_no_morphology_debounce": "w/o \n Morphology \n Debounce",
-    "ablate_no_tracking": "w/o \n Tracking",
+    "ablate_no_bg_ema": "w/o\nBG EMA",
+    "ablate_no_cumulative_score": "w/o\nCumulative\nScore",
+    "ablate_no_hysteresis": "w/o\nHysteresis",
+    "ablate_no_morphology_debounce": "w/o\nMorphology\nDebounce",
+    "ablate_no_tracking": "w/o\nTracking",
 }
 
 delta_plot["variant_label"] = (
@@ -89,7 +89,7 @@ def format_cell(value, metric, digits=1):
     """
     rounded = round(float(value), digits)
 
-    if metric == "Latency steps ↓":
+    if metric == "Latency\nSteps↓":
         if rounded == 0:
             return f"{0:.{digits}f}%"
         if rounded < 0:
@@ -131,8 +131,14 @@ im = ax.imshow(
 # 坐标轴
 ax.set_xticks(np.arange(heat_raw.shape[1]))
 ax.set_yticks(np.arange(heat_raw.shape[0]))
-ax.set_xticklabels(heat_raw.columns, fontsize=15, fontweight="bold")
-ax.set_yticklabels(heat_raw.index, fontsize=15, fontweight="bold")
+ax.set_xticklabels(heat_raw.columns, fontsize=20, fontweight="bold")
+ax.set_yticklabels(
+    heat_raw.index,
+    fontsize=18,
+    fontweight="bold",
+    ha="right",
+    multialignment="right",
+)
 
 # x 轴标签放在顶部
 ax.tick_params(
@@ -183,8 +189,8 @@ ax.set_ylabel("")
 cbar = fig.colorbar(
     im,
     ax=ax,
-    fraction=0.035,
-    pad=0.03,
+    fraction=0.03,
+    pad=0.015,
 )
 
 # 色条刻度使用原始百分比，但位置按 log 后的坐标放置
@@ -198,12 +204,15 @@ mask = (tick_positions >= -max_abs_log) & (tick_positions <= max_abs_log)
 
 cbar.set_ticks(tick_positions[mask])
 cbar.set_ticklabels([format_percent(t, digits=0) for t in raw_ticks[mask]])
+cbar.ax.tick_params(labelsize=12)
+for label in cbar.ax.get_yticklabels():
+    label.set_fontweight("bold")
 
-cbar.set_label(
-    "Relative performance change vs. full",
-    fontsize=15,
-    fontweight="bold",
-)
+# cbar.set_label(
+#     "Relative performance change vs. full",
+#     fontsize=15,
+#     fontweight="bold",
+# )
 
 plt.tight_layout()
 

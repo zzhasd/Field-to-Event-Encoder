@@ -318,9 +318,13 @@ def draw_figure(
         label.set_fontweight("bold")
 
     
-    # 隐藏顶部的无用边框
-    latency_ax.spines['top'].set_visible(False)
-    score_ax.spines['top'].set_visible(False)
+    # 为柱状图与箱线图共享的绘图区绘制黑色上下边框
+    for ax in (latency_ax, score_ax):
+        ax.spines['top'].set_visible(True)
+        ax.spines['top'].set_color("black")
+        ax.spines['top'].set_linewidth(1.5)
+        ax.spines['bottom'].set_color("black")
+        ax.spines['bottom'].set_linewidth(1.5)
     
     latency_ax.margins(x=0.06)
 
