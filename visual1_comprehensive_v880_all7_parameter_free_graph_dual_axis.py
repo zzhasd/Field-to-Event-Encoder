@@ -1,6 +1,6 @@
 """Visualize the v8.8.0 seven-method, fourteen-scenario comparison.
 
-Four diagnosis-score bars use the left axis, mean token consumption uses the
+Four diagnosis-score bars use the left axis, mean input-token consumption uses the
 right axis, and seed-level dots plus 95% Student-t confidence intervals expose
 variation across the ten repeated seeds. Rule methods report token usage as N/A.
 """
@@ -14,6 +14,8 @@ from typing import Dict, Iterable, List, Tuple
 import matplotlib
 
 matplotlib.use("Agg")
+matplotlib.rcParams["pdf.fonttype"] = 42
+matplotlib.rcParams["ps.fonttype"] = 42
 import matplotlib.pyplot as plt
 from matplotlib.colors import to_rgb
 import numpy as np
@@ -50,7 +52,7 @@ METHOD_ORDER = [
 ]
 
 METHOD_LABELS = {
-    "f2e_events_graph_llm": "Adaptive graph + LLM",
+    "f2e_events_graph_llm": "F2E graph + LLM",
     "f2e_events_llm": "F2E + LLM",
     "threshold_matrix_llm": "Threshold + LLM",
     "raw_matrix_summary_llm": "Raw matrix + LLM",
@@ -153,17 +155,17 @@ def seed_metric(seed_rows: pd.DataFrame, metric: str) -> float:
         return float(
             pd.to_numeric(subset["template_rejection_success"], errors="coerce").mean()
         )
-    if metric == "mean_total_tokens":
+    if metric == "mean_prompt_tokens":
         subset = seed_rows[
             seed_rows["token_count_source"].fillna("").ne("not_applicable_rules")
         ]
-        return float(pd.to_numeric(subset["total_tokens"], errors="coerce").mean())
+        return float(pd.to_numeric(subset["prompt_tokens"], errors="coerce").mean())
     raise ValueError(f"Unsupported metric: {metric}")
 
 
 def build_seed_summary(records: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    metrics = METRICS + ["mean_total_tokens"]
+    metrics = METRICS + ["mean_prompt_tokens"]
     for (method, seed_index), seed_rows in records.groupby(
         ["method", "seed_index"], sort=True
     ):
@@ -214,7 +216,7 @@ def shown_points(values: np.ndarray) -> np.ndarray:
 
 
 def validate_inputs(summary: pd.DataFrame, records: pd.DataFrame) -> None:
-    required_summary = {"method", "mean_total_tokens", *METRICS}
+    required_summary = {"method", "mean_prompt_tokens", *METRICS}
     required_records = {
         "ambiguous",
         "diagnostic_goal",
@@ -228,7 +230,7 @@ def validate_inputs(summary: pd.DataFrame, records: pd.DataFrame) -> None:
         "prediction",
         "correct",
         "template_rejection_success",
-        "total_tokens",
+        "prompt_tokens",
         "token_count_source",
     }
     missing_summary = sorted(required_summary - set(summary.columns))
@@ -321,12 +323,12 @@ def main() -> None:
             mean, ci = mean_ci95(values)
             score_stats[(method, metric)] = (mean * 100.0, ci * 100.0)
         values = pd.to_numeric(
-            method_seed_rows["mean_total_tokens"], errors="coerce"
+            method_seed_rows["mean_prompt_tokens"], errors="coerce"
         ).dropna().to_numpy()
         token_values[method] = values
         token_stats[method] = mean_ci95(values)
 
-    figure, score_axis = plt.subplots(figsize=(19.5, 6.8))
+    figure, score_axis = plt.subplots(figsize=(19.5, 5.8))
     x = np.arange(len(METHOD_ORDER), dtype=float) * 1.35
     bar_width = 0.15
     group_count = len(METRICS) + 1
@@ -394,7 +396,7 @@ def main() -> None:
         edgecolor=TOKEN_COLOR,
         alpha=0.35,
         hatch="//",
-        label="Tokens",
+        label="Input Tokens",
         zorder=1,
     )
     dark_token = darker(TOKEN_COLOR)
@@ -437,37 +439,36 @@ def main() -> None:
 
     score_axis.set_xticks(x)
     score_axis.set_xticklabels(
-        [METHOD_LABELS[m] for m in METHOD_ORDER], fontsize=14, fontweight="bold"
+        [METHOD_LABELS[m] for m in METHOD_ORDER], fontsize=15, fontweight="bold"
     )
     score_axis.set_ylabel("Score (%)", fontsize=20, fontweight="bold")
-    score_axis.set_ylim(0, 118)
+    score_axis.set_ylim(0, 102)
     score_axis.grid(axis="y", linestyle="--", alpha=0.35)
     score_axis.margins(x=0.04)
     score_axis.tick_params(axis="y", labelsize=15)
-    token_axis.set_ylabel("Tokens", fontsize=20, fontweight="bold", color=TOKEN_COLOR)
+    token_axis.set_ylabel("Input Tokens", fontsize=20, fontweight="bold", color=TOKEN_COLOR)
     token_axis.tick_params(axis="y", labelsize=15, colors=TOKEN_COLOR, width=2.0)
     token_axis.spines["right"].set_color(TOKEN_COLOR)
     token_axis.spines["right"].set_linewidth(2.0)
-    token_axis.set_ylim(bottom=0)
+    token_axis.set_ylim(0, 5500)
     for axis in (score_axis, token_axis):
         for tick in axis.get_yticklabels():
             tick.set_fontweight("bold")
-    max_tokens = np.nanmax(token_means)
-    if np.isfinite(max_tokens) and max_tokens > 0:
-        token_axis.set_ylim(0, max_tokens * 1.18)
-
     handles1, labels1 = score_axis.get_legend_handles_labels()
     handles2, labels2 = token_axis.get_legend_handles_labels()
     score_axis.legend(
         handles1 + handles2,
         labels1 + labels2,
         ncol=5,
-        loc="lower center",
-        bbox_to_anchor=(0.5, 1.005),
+        loc="upper right",
+        bbox_to_anchor=(0.99, 0.99),
         prop={"size": 18, "weight": "bold"},
         frameon=False,
         borderaxespad=0.0,
-        columnspacing=1.0,
+        columnspacing=0.6,
+        handletextpad=0.4,
+        handlelength=1.8,
+        labelspacing=0.3,
     )
     figure.tight_layout(pad=0.15)
 
@@ -484,7 +485,7 @@ def main() -> None:
     token_table = pd.DataFrame(
         {
             "Method": [METHOD_LABELS[m] for m in METHOD_ORDER],
-            "Mean tokens": [
+            "Mean input tokens": [
                 round(token_stats[m][0], 3) if np.isfinite(token_stats[m][0]) else "N/A"
                 for m in METHOD_ORDER
             ],

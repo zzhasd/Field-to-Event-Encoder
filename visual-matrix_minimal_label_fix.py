@@ -1,5 +1,8 @@
 import pandas as pd
 import numpy as np
+import matplotlib
+matplotlib.rcParams["pdf.fonttype"] = 42
+matplotlib.rcParams["ps.fonttype"] = 42
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
 
@@ -220,7 +223,10 @@ plt.tight_layout()
 # 9. 保存图片
 # =========================
 out_path = "ablation_relative_heatmap_log_scaled_zero_clean.png"
+pdf_path = "ablation_relative_heatmap_log_scaled_zero_clean.pdf"
 plt.savefig(out_path, dpi=300, bbox_inches="tight")
+plt.savefig(pdf_path, bbox_inches="tight")
 plt.show()
 
 print(f"Saved figure to: {out_path}")
+print(f"Saved figure to: {pdf_path}")
