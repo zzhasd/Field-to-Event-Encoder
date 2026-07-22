@@ -20,7 +20,6 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import to_rgb
 import numpy as np
 import pandas as pd
-from scipy.stats import t as student_t
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -77,7 +76,6 @@ METRIC_LABELS = {
 
 SCORE_COLORS = ["#4C78A8", "#F58518", "#54A24B", "#E45756"]
 TOKEN_COLOR = "#6F4E9C"
-CONFIDENCE_LEVEL = 0.95
 EXPECTED_SEEDS = 10
 EXPECTED_SCENARIOS_PER_SEED = 14
 ZERO_SCORE_DISPLAY_PERCENT = 0.1
@@ -179,18 +177,14 @@ def build_seed_summary(records: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def mean_ci95(values: np.ndarray) -> Tuple[float, float]:
+def mean_sd(values: np.ndarray) -> Tuple[float, float]:
     values = np.asarray(values, dtype=float)
     values = values[np.isfinite(values)]
     if len(values) == 0:
         return np.nan, np.nan
     if len(values) == 1:
         return float(values[0]), 0.0
-    standard_error = float(np.std(values, ddof=1) / np.sqrt(len(values)))
-    critical = float(
-        student_t.ppf((1.0 + CONFIDENCE_LEVEL) / 2.0, len(values) - 1)
-    )
-    return float(np.mean(values)), critical * standard_error
+    return float(np.mean(values)), float(np.std(values, ddof=1))
 
 
 def darker(color: str, factor: float = 0.58) -> Tuple[float, float, float]:
@@ -319,13 +313,13 @@ def main() -> None:
         for metric in METRICS:
             values = pd.to_numeric(method_seed_rows[metric], errors="coerce").dropna().to_numpy()
             score_values[(method, metric)] = values * 100.0
-            mean, ci = mean_ci95(values)
-            score_stats[(method, metric)] = (mean * 100.0, ci * 100.0)
+            mean, sd = mean_sd(values)
+            score_stats[(method, metric)] = (mean * 100.0, sd * 100.0)
         values = pd.to_numeric(
             method_seed_rows["mean_prompt_tokens"], errors="coerce"
         ).dropna().to_numpy()
         token_values[method] = values
-        token_stats[method] = mean_ci95(values)
+        token_stats[method] = mean_sd(values)
 
     figure, score_axis = plt.subplots(figsize=(19.5, 4.5))
     x = np.arange(len(METHOD_ORDER), dtype=float) * 1.35
@@ -337,7 +331,7 @@ def main() -> None:
         offset = (metric_index - (group_count - 1) / 2.0) * bar_width
         means = np.asarray([score_stats[(m, metric)][0] for m in METHOD_ORDER])
         shown_means = shown_points(means)
-        cis = np.asarray([score_stats[(m, metric)][1] for m in METHOD_ORDER])
+        sds = np.asarray([score_stats[(m, metric)][1] for m in METHOD_ORDER])
         bars = score_axis.bar(
             x + offset,
             shown_means,
@@ -362,7 +356,7 @@ def main() -> None:
         score_axis.errorbar(
             x + offset,
             shown_means,
-            yerr=cis,
+            yerr=sds,
             fmt="none",
             ecolor=dark,
             elinewidth=1.6,
@@ -384,7 +378,7 @@ def main() -> None:
     token_axis = score_axis.twinx()
     token_offset = (len(METRICS) - (group_count - 1) / 2.0) * bar_width
     token_means = np.asarray([token_stats[m][0] for m in METHOD_ORDER])
-    token_cis = np.asarray([token_stats[m][1] for m in METHOD_ORDER])
+    token_sds = np.asarray([token_stats[m][1] for m in METHOD_ORDER])
     finite_tokens = np.isfinite(token_means)
     shown_token_means = np.where(finite_tokens, token_means, 0.0)
     token_bars = token_axis.bar(
@@ -415,7 +409,7 @@ def main() -> None:
     token_axis.errorbar(
         (x + token_offset)[finite_tokens],
         token_means[finite_tokens],
-        yerr=token_cis[finite_tokens],
+        yerr=token_sds[finite_tokens],
         fmt="none",
         ecolor=dark_token,
         elinewidth=1.6,
@@ -488,7 +482,7 @@ def main() -> None:
                 round(token_stats[m][0], 3) if np.isfinite(token_stats[m][0]) else "N/A"
                 for m in METHOD_ORDER
             ],
-            "95% CI half-width": [
+            "SD": [
                 round(token_stats[m][1], 3) if np.isfinite(token_stats[m][1]) else "N/A"
                 for m in METHOD_ORDER
             ],
