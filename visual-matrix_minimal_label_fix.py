@@ -20,14 +20,14 @@ metrics = {
     "Mean\nIoU": "mean_iou",
     "Shape\nAcc.": "shape_accuracy",
     "Trend\nAcc.": "trend_accuracy",
-    "Latency\nSteps↓": "latency_steps",
+    "Detection\nDelay↓": "latency_steps",
 }
 
 # 正向指标：越大越好
 positive_metrics = ["Detection\nF1", "Mean\nIoU", "Shape\nAcc.", "Trend\nAcc."]
 
 # 负向指标：越小越好
-negative_metrics = ["Latency\nSteps↓"]
+negative_metrics = ["Detection\nDelay↓"]
 
 # =========================
 # 3. 以 full 为基准计算相对变化
@@ -92,7 +92,7 @@ def format_cell(value, metric, digits=1):
     """
     rounded = round(float(value), digits)
 
-    if metric == "Latency\nSteps↓":
+    if metric == "Detection\nDelay↓":
         if rounded == 0:
             return f"{0:.{digits}f}%"
         if rounded < 0:

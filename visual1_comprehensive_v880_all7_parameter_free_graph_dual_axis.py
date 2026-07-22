@@ -52,27 +52,27 @@ METHOD_ORDER = [
 ]
 
 METHOD_LABELS = {
-    "f2e_events_graph_llm": "F2E graph + LLM",
-    "f2e_events_llm": "F2E + LLM",
-    "threshold_matrix_llm": "Threshold + LLM",
-    "raw_matrix_summary_llm": "Raw matrix + LLM",
-    "threshold_matrix_rules": "Threshold + rules",
-    "f2e_events_rules": "F2E + rules",
-    "raw_field_image_vlm": "Raw field image + VLM",
+    "f2e_events_graph_llm": "F2E Graph LLM",
+    "f2e_events_llm": "F2E LLM",
+    "threshold_matrix_llm": "Threshold LLM",
+    "raw_matrix_summary_llm": "Raw matrix LLM",
+    "threshold_matrix_rules": "Threshold rules",
+    "f2e_events_rules": "F2E rules",
+    "raw_field_image_vlm": "Raw field image VLM",
 }
 
 METRICS = [
     "accident_classification_accuracy",
     "macro_f1",
-    "hard_reasoning_alignment_score",
+    "hard_case_accuracy",
     "ood_template_rejection_success",
 ]
 
 METRIC_LABELS = {
     "accident_classification_accuracy": "Acc",
-    "macro_f1": "MacroF1",
-    "hard_reasoning_alignment_score": "Hard reason",
-    "ood_template_rejection_success": "OOD reject",
+    "macro_f1": "Macro-F1",
+    "hard_case_accuracy": "Hard-Case Acc.",
+    "ood_template_rejection_success": "OOD Rejection",
 }
 
 SCORE_COLORS = ["#4C78A8", "#F58518", "#54A24B", "#E45756"]
@@ -139,16 +139,14 @@ def seed_metric(seed_rows: pd.DataFrame, metric: str) -> float:
         return float(pd.to_numeric(seed_rows["correct"], errors="coerce").mean())
     if metric == "macro_f1":
         return macro_f1(seed_rows["ground_truth"], seed_rows["prediction"])
-    if metric == "hard_reasoning_alignment_score":
+    if metric == "hard_case_accuracy":
         mask = (
-            seed_rows["hard_family"].fillna("standard").ne("standard")
-            | true_mask(seed_rows["ambiguous"])
+            true_mask(seed_rows["ambiguous"])
+            | true_mask(seed_rows["unseen_combo"])
             | true_mask(seed_rows["expected_review"])
         )
         return float(
-            pd.to_numeric(
-                seed_rows.loc[mask, "reasoning_alignment_score"], errors="coerce"
-            ).mean()
+            pd.to_numeric(seed_rows.loc[mask, "correct"], errors="coerce").mean()
         )
     if metric == "ood_template_rejection_success":
         subset = seed_rows[seed_rows["diagnostic_goal"] == "template_rejection"]
@@ -230,6 +228,7 @@ def validate_inputs(summary: pd.DataFrame, records: pd.DataFrame) -> None:
         "prediction",
         "correct",
         "template_rejection_success",
+        "unseen_combo",
         "prompt_tokens",
         "token_count_source",
     }
@@ -328,7 +327,7 @@ def main() -> None:
         token_values[method] = values
         token_stats[method] = mean_ci95(values)
 
-    figure, score_axis = plt.subplots(figsize=(19.5, 5.8))
+    figure, score_axis = plt.subplots(figsize=(19.5, 4.5))
     x = np.arange(len(METHOD_ORDER), dtype=float) * 1.35
     bar_width = 0.15
     group_count = len(METRICS) + 1
@@ -376,7 +375,7 @@ def main() -> None:
             labels=[f"{value:.1f}" for value in means],
             padding=6,
             rotation=90,
-            fontsize=14,
+            fontsize=15,
             fontweight="bold",
         )
         for label in labels:
@@ -430,7 +429,7 @@ def main() -> None:
         labels=token_labels,
         padding=6,
         rotation=90,
-        fontsize=14,
+        fontsize=15,
         fontweight="bold",
         color=TOKEN_COLOR,
     )
@@ -439,7 +438,7 @@ def main() -> None:
 
     score_axis.set_xticks(x)
     score_axis.set_xticklabels(
-        [METHOD_LABELS[m] for m in METHOD_ORDER], fontsize=15, fontweight="bold"
+        [METHOD_LABELS[m] for m in METHOD_ORDER], fontsize=17, fontweight="bold"
     )
     score_axis.set_ylabel("Score (%)", fontsize=20, fontweight="bold")
     score_axis.set_ylim(0, 102)
@@ -478,8 +477,8 @@ def main() -> None:
     pdf_path = safe_output_path(
         os.path.join(fig_dir, "layer2_v880_all7_scores_tokens_dual_axis.pdf")
     )
-    figure.savefig(png_path, dpi=300, bbox_inches="tight", pad_inches=0.01)
-    figure.savefig(pdf_path, bbox_inches="tight", pad_inches=0.01)
+    figure.savefig(png_path, dpi=600, bbox_inches="tight", pad_inches=0.01)
+    figure.savefig(pdf_path, dpi=600, bbox_inches="tight", pad_inches=0.01)
     plt.close(figure)
 
     token_table = pd.DataFrame(
