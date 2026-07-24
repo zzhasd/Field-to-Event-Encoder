@@ -3090,7 +3090,7 @@ def run_layer2(scenarios: List[AccidentScenario], seeds: int, steps: int, obs_ra
     token_counter = token_counter or TokenFallbackCounter()
     for epi in range(seeds):
         for sc_idx, sc in enumerate(scenarios):
-            seed = base_seed + 2000000 + 100000 * epi + 1000 * sc_idx
+            seed = base_seed + 100000 * epi + 1000 * sc_idx
             fixed_diag_t = diagnosis_query_t(sc, steps, llm_interval_steps)
             trace_f2e = collect_run_trace(
                 sc, seed, steps, "threshold_matrix_observer" if threshold_only else "f2e_encoder", obs_ratio, all_fields=True,

@@ -18,9 +18,9 @@ from lab_ontologyEvaluation_and_ablation import (
     ProgressMeter, make_combo_cases, precision_recall_f1,
 )
 
-EXPERIMENT_VERSION = "v1.0.0"
+EXPERIMENT_VERSION = "v1.1.0"
 REFERENCE_GRID_SIZE = 30
-DEFAULT_GRID_SIZES = (30, 60, 90, 120, 150, 180, 210)
+DEFAULT_GRID_SIZES = (30, 90, 150, 210)
 FULL_ENCODER_FLAGS = (
     "use_background_ema", "use_cumulative_score", "use_hysteresis",
     "use_tracking", "use_morphology_debounce",
@@ -37,6 +37,12 @@ PRIMARY_METRICS = (
 def safe_mean(values: Iterable[Optional[float]]) -> Optional[float]:
     xs = [float(x) for x in values if x is not None and np.isfinite(float(x))]
     return float(np.mean(xs)) if xs else None
+
+
+def sample_std(values: Iterable[Optional[float]]) -> Optional[float]:
+    """Sample standard deviation across independent seed/round aggregates."""
+    xs = [float(x) for x in values if x is not None and np.isfinite(float(x))]
+    return float(np.std(xs, ddof=1)) if len(xs) >= 2 else 0.0 if xs else None
 
 
 def iou(a: np.ndarray, b: np.ndarray) -> float:
@@ -403,6 +409,42 @@ def analyze(grid_rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     return result
 
 
+def summarize_round_statistics(
+    round_rows: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return the paper table as mean +/- sample SD across random seeds."""
+    grouped: Dict[int, List[Dict[str, Any]]] = {}
+    for row in round_rows:
+        grouped.setdefault(int(row["grid_size"]), []).append(row)
+    output: List[Dict[str, Any]] = []
+    for size, rows in sorted(grouped.items()):
+        item: Dict[str, Any] = {
+            "grid_size": size,
+            "n_rounds": len(rows),
+        }
+        for metric in ("detection_f1", "mean_iou", "latency_ms_per_frame"):
+            values = [row.get(metric) for row in rows]
+            item[f"{metric}_mean"] = safe_mean(values)
+            item[f"{metric}_sample_std"] = sample_std(values)
+        output.append(item)
+    return output
+
+
+def markdown_summary_table(rows: Sequence[Dict[str, Any]]) -> str:
+    lines = [
+        "| Grid L | Detection F1 ↑ | Mean IoU ↑ | Time (ms/step) ↓ |",
+        "|---:|---:|---:|---:|",
+    ]
+    for row in rows:
+        lines.append(
+            "| {grid_size} | {detection_f1_mean:.4f} ± "
+            "{detection_f1_sample_std:.4f} | {mean_iou_mean:.4f} ± "
+            "{mean_iou_sample_std:.4f} | {latency_ms_per_frame_mean:.2f} ± "
+            "{latency_ms_per_frame_sample_std:.2f} |".format(**row)
+        )
+    return "\n".join(lines) + "\n"
+
+
 def select_cases(
     max_cases: Optional[int], normal: bool,
 ) -> Tuple[List[TestCase], int]:
@@ -486,6 +528,7 @@ def main() -> None:
 
     rounds = aggregate(records, ("grid_size", "round", "seed"))
     grids = aggregate(records, ("grid_size",))
+    paper_table = summarize_round_statistics(rounds)
     analysis = analyze(grids)
     config = {
         "experiment_version": EXPERIMENT_VERSION,
@@ -518,6 +561,7 @@ def main() -> None:
         "complexity_analysis": analysis,
         "aggregate_by_grid_size": grids,
         "metrics_by_round": rounds,
+        "paper_table_mean_sample_std": paper_table,
         "case_round_records": records,
     }
     os.makedirs(args.out_dir, exist_ok=True)
@@ -535,8 +579,18 @@ def main() -> None:
     )
     save_csv(os.path.join(args.out_dir, "metrics_by_round.csv"), rounds)
     save_csv(
+        os.path.join(args.out_dir, "paper_table_mean_sample_std.csv"),
+        paper_table,
+    )
+    save_csv(
         os.path.join(args.out_dir, "case_round_records.csv"), records
     )
+    with open(
+        os.path.join(args.out_dir, "paper_table_mean_sample_std.md"),
+        "w",
+        encoding="utf-8",
+    ) as f:
+        f.write(markdown_summary_table(paper_table))
 
     print(f"\n===== Full Encoder Time Complexity {EXPERIMENT_VERSION} =====")
     print(
@@ -551,6 +605,8 @@ def main() -> None:
             f"{metric}={row.get(metric)}" for metric in PRIMARY_METRICS
         )
         print(f"  grid={row['grid_size']}: {metrics}")
+    print("\nMean +/- sample SD across rounds:")
+    print(markdown_summary_table(paper_table), end="")
     if "side_length_exponent" in analysis:
         print(
             f"\nLatency side-length exponent: "
