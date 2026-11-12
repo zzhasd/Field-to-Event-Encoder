@@ -2,13 +2,16 @@
 
 This entry point reuses the simulator, F2E encoder, adaptive evidence graph,
 prompts, rules, API client, and scoring functions from
-``lab_comprehensive_comparison_f2e_graph_neutral_new.py``.  It changes only the
-evaluation schedule and representation horizon:
+``lab_comprehensive_comparison_f2e_graph_neutral_new.py``.  It uses the same
+500-step physical timeline and map/RNG replay protocol as ``pipeline_compare``,
+while replacing TFRA reconstructions with complete true physical fields:
 
 * every still-active method is queried every ``call_interval_steps``;
 * F2E, Graph, F2E rules, and VLM methods use the most recent
   ``window_steps`` observed matrices and are rebuilt independently per window;
 * threshold and raw-matrix methods diagnose the current time point;
+* original 170-step effect onsets are scaled to the run length and remain
+  active until the terminal frame, exactly as in ``pipeline_compare``;
 * a method stops independently after its first exact correct prediction;
 * the final step is queried even when it is not an interval multiple.
 
@@ -20,6 +23,7 @@ early stopping.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -29,11 +33,12 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+from scipy.ndimage import label
 
 import lab_comprehensive_comparison_f2e_graph_neutral_new as base
 
 
-EXPERIMENT_VERSION = "v8.8.0-windowed-detection-delay-v1"
+EXPERIMENT_VERSION = "v8.8.0-windowed-detection-delay-v2-pipeline-timeline"
 
 METHOD_LABELS = {
     "f2e_events_graph_llm": "F2E Graph LLM",
@@ -63,6 +68,95 @@ F2E_WINDOW_METHODS = frozenset({
     "f2e_events_llm",
     "f2e_events_rules",
 })
+
+
+def scale_scenarios_to_pipeline_timeline(
+    scenarios: Sequence[base.AccidentScenario],
+    steps: int,
+) -> List[base.AccidentScenario]:
+    """Match pipeline_compare's 170-step-to-run-length incident timeline."""
+    scaled = copy.deepcopy(list(scenarios))
+    for scenario in scaled:
+        for injected_effect in scenario.testcase.effects:
+            injected_effect.start = max(
+                1,
+                int(round(float(injected_effect.start) / 170.0 * int(steps))),
+            )
+            injected_effect.end = int(steps)
+    return scaled
+
+
+def make_pipeline_obstacle_grid(
+    size: int,
+    obstacle_density: float,
+    seed: int,
+) -> np.ndarray:
+    """Reproduce pipeline_compare's seeded SensorGridEnv obstacle map."""
+    rng = np.random.RandomState(int(seed))
+    grid = np.zeros((int(size), int(size)), dtype=np.uint8)
+    obstacle_count = int(grid.size * float(obstacle_density))
+    obstacle_indices = rng.choice(grid.size, obstacle_count, replace=False)
+    grid[np.unravel_index(obstacle_indices, grid.shape)] = 1
+
+    free_space = 1 - grid
+    structure = np.asarray([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8)
+    components, _ = label(free_space, structure=structure)
+    sizes = np.bincount(components.ravel())
+    sizes[0] = 0
+    grid[components != int(sizes.argmax())] = 1
+    return grid
+
+
+def collect_pipeline_full_field_trace(
+    scenario: base.AccidentScenario,
+    seed: int,
+    steps: int,
+    obstacle_density: float,
+) -> base.RunTrace:
+    """Build the same true-field replay as pipeline_compare, without TFRA."""
+    started = time.perf_counter()
+    grid = make_pipeline_obstacle_grid(base.GRID_SIZE, obstacle_density, seed)
+    field_keys = tuple(base.FIELDS)
+    rng = np.random.default_rng(int(seed) + 99173)
+    fields_window: List[Dict[str, np.ndarray]] = []
+    fields_last: Dict[str, np.ndarray] = {}
+    gt_last: List[Dict[str, Any]] = []
+
+    # pipeline_compare materializes physical frames with one-based frame
+    # indices and a single episode RNG before any reconstruction takes place.
+    for frame in range(1, int(steps) + 1):
+        current, gt_records = base.build_current_fields(
+            grid,
+            scenario.testcase,
+            frame,
+            field_keys,
+            scenario.stress,
+            rng,
+        )
+        fields_last = current
+        gt_last = gt_records
+        fields_window.append({key: value.copy() for key, value in current.items()})
+
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    low_metrics = {
+        "latency_ms_per_frame": round(elapsed_ms / max(1, int(steps)), 6),
+        "detector_total_latency_ms": 0.0,
+        "detector_latency_ms_per_frame": 0.0,
+    }
+    return base.RunTrace(
+        scenario=scenario,
+        seed=int(seed),
+        detector_name="pipeline_full_true_field_replay",
+        events_last=[],
+        events_all=[],
+        event_snapshots=[],
+        fields_window=fields_window,
+        fields_last=fields_last,
+        grid=grid,
+        gt_last=gt_last,
+        low_metrics=low_metrics,
+        latency_ms=elapsed_ms,
+    )
 
 
 def diagnosis_schedule(steps: int, interval_steps: int) -> List[int]:
@@ -211,6 +305,7 @@ def build_windowed_method_inputs(
 ) -> Dict[str, Dict[str, Any]]:
     """Build method inputs while preserving each underlying base algorithm."""
     query_t = int(query_step) - 1
+    diagnosis_frame = int(query_step)
     window_start_step, _, window_frame_count = window_bounds(query_step, window_steps)
     window_start_t = window_start_step - 1
     fields_history = trace.fields_window[: query_t + 1]
@@ -223,7 +318,8 @@ def build_windowed_method_inputs(
     window_quality = base.observation_quality(fields_window, free_mask)
     result: Dict[str, Dict[str, Any]] = {
         "diagnosis_t": {
-            "t": query_t,
+            "t": diagnosis_frame,
+            "array_index": query_t,
             "query_step": int(query_step),
             "window_start_step": int(window_start_step),
             "window_end_step": int(query_step),
@@ -243,7 +339,7 @@ def build_windowed_method_inputs(
             "alarm_matrix": alarm_matrix,
             "observation_quality": current_quality,
             "representation_latency_ms": elapsed_ms,
-            "diagnosis_t": query_t,
+            "diagnosis_t": diagnosis_frame,
             "input_frame_count": 1,
             "calibration_history_frames": len(fields_history),
         }
@@ -264,7 +360,7 @@ def build_windowed_method_inputs(
         events_raw, f2e_elapsed_ms = reconstruct_f2e_window(
             fields_window,
             trace.grid,
-            global_start_t=window_start_t,
+            global_start_t=window_start_step,
         )
         events = base.summarize_events(
             events_raw,
@@ -294,7 +390,7 @@ def build_windowed_method_inputs(
             "representation_latency_ms": f2e_elapsed_ms,
             "graph_representation_latency_ms": f2e_elapsed_ms + graph_elapsed_ms,
             "graph_construction_latency_ms": graph_elapsed_ms,
-            "diagnosis_t": query_t,
+            "diagnosis_t": diagnosis_frame,
             "input_frame_count": len(fields_window),
         }
 
@@ -311,7 +407,7 @@ def build_windowed_method_inputs(
             fields_window,
             os.path.join(image_dir, f"{filename}.png"),
             trace.grid,
-            global_start_t=window_start_t,
+            global_start_t=window_start_step,
             mode=vlm_frame_mode,
             num_frames=vlm_num_frames,
         )
@@ -319,7 +415,7 @@ def build_windowed_method_inputs(
         result["raw_field_image"] = {
             "image_path": image_path,
             "image_filename_policy": "blind_no_scenario_id_no_accident_type",
-            "diagnosis_t": query_t,
+            "diagnosis_t": diagnosis_frame,
             "vlm_frame_mode": vlm_frame_mode,
             "vlm_frame_indices": frame_indices,
             "representation_latency_ms": elapsed_ms,
@@ -481,7 +577,7 @@ def make_call_record(
     first_effect_start_t = min(effect_starts) if effect_starts else None
     last_effect_end_t_exclusive = max(effect_ends) if effect_ends else None
     detection_delay_after_onset = (
-        (query_step - 1) - first_effect_start_t
+        query_step - first_effect_start_t
         if correct and first_effect_start_t is not None
         else None
     )
@@ -500,7 +596,7 @@ def make_call_record(
         "method_display_name": METHOD_LABELS[method],
         "call_index": int(call_index),
         "query_step": int(query_step),
-        "diagnosis_t": int(query_step - 1),
+        "diagnosis_t": int(query_step),
         "input_mode": input_mode,
         "input_start_step": int(input_start_step),
         "input_end_step": int(window_end_step),
@@ -519,7 +615,7 @@ def make_call_record(
         "prediction_made_while_effect_active": (
             None
             if first_effect_start_t is None or last_effect_end_t_exclusive is None
-            else int(first_effect_start_t <= query_step - 1 < last_effect_end_t_exclusive)
+            else int(first_effect_start_t <= query_step < last_effect_end_t_exclusive)
         ),
         "detection_delay_after_onset_steps": detection_delay_after_onset,
         "ambiguous": scenario.ambiguous,
@@ -789,20 +885,15 @@ def run_detection_delay(
     for seed_index in range(seeds):
         for scenario_index, scenario in enumerate(scenarios):
             seed = base_seed + 100000 * seed_index + 1000 * scenario_index
-            # Generate one shared causal observation stream.  No F2E state from
-            # this collection pass is used by a windowed method.
-            trace = base.collect_run_trace(
+            # Generate the pipeline-compatible complete true-field replay.
+            # This is the controlled upper-bound counterpart of the TFRA
+            # reconstructed replay used by pipeline_compare.
+            trace = collect_pipeline_full_field_trace(
                 scenario,
                 seed,
                 steps,
-                "threshold_matrix_observer",
-                obs_ratio,
-                all_fields=True,
-                capture_fields=True,
-                snapshot_times=(),
-                retain_snapshot_masks=False,
+                obstacle_density=obs_ratio,
             )
-            scenario_for_grid = trace.scenario
             active = set(methods)
             rows_by_method: Dict[str, List[Dict[str, Any]]] = {
                 method: [] for method in methods
@@ -866,7 +957,7 @@ def run_detection_delay(
                                 base.execute_layer2_model_method,
                                 method,
                                 method_inputs,
-                                query_step - 1,
+                                query_step,
                                 history_frames,
                                 client,
                                 api_mode,
@@ -897,7 +988,7 @@ def run_detection_delay(
                         result = base.execute_layer2_model_method(
                             method,
                             method_inputs,
-                            query_step - 1,
+                            query_step,
                             method_history_frames(method, window_frame_count),
                             client,
                             api_mode,
@@ -910,7 +1001,7 @@ def run_detection_delay(
 
                     representation_ms, call_result, diag, wall_ms = result
                     row = make_call_record(
-                        scenario_for_grid,
+                        scenario,
                         seed_index,
                         seed,
                         method,
@@ -952,7 +1043,7 @@ def run_detection_delay(
             for method in methods:
                 case_rows.append(
                     make_case_summary(
-                        scenario_for_grid,
+                        scenario,
                         seed_index,
                         seed,
                         method,
@@ -1046,7 +1137,10 @@ def main() -> None:
 
     methods = base.parse_layer2_methods(args.layer2_methods)
     seeds = args.seeds if args.seeds is not None else (1 if args.profile == "quick" else 10)
-    scenarios = base.make_accident_scenarios(args.profile)
+    scenarios = scale_scenarios_to_pipeline_timeline(
+        base.make_accident_scenarios(args.profile),
+        args.steps,
+    )
     if args.max_scenarios is not None:
         scenarios = scenarios[: args.max_scenarios]
     schedule = diagnosis_schedule(args.steps, args.call_interval_steps)
@@ -1147,6 +1241,21 @@ def main() -> None:
             ]
             for scenario in scenarios
         },
+        "scenario_timeline_policy": (
+            "pipeline_compare: start=max(1,round(original_start/170*steps)); "
+            "end=steps"
+        ),
+        "scenario_metadata_policy": (
+            "scaled canonical scenario is used for both physical generation and "
+            "scoring/reporting; effect centers are not relocated"
+        ),
+        "physical_field_replay_policy": (
+            "pipeline_compare true-field protocol: SensorGridEnv-compatible map; "
+            "frames=1..steps; one episode RNG default_rng(seed+99173); no TFRA"
+        ),
+        "graph_residual_policy": (
+            "retain lab residual candidates; intentionally not changed in this revision"
+        ),
         "call_interval_steps": args.call_interval_steps,
         "window_steps": args.window_steps,
         "query_schedule": schedule_rows,
